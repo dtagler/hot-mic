@@ -8,3 +8,6 @@ dist/*.lib
 
 # playwright-cli session artifacts (snapshots, console logs from screenshot generation)
 .playwright-cli/
+
+# Claude Code session state
+.claude/
