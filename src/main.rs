@@ -18,7 +18,10 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use detect::{DeviceState, Watcher};
-use hotmic::{mic_should_show, should_start_debounce, tray_appearance, ICON_IDLE};
+use hotmic::{
+    mic_should_show, should_start_debounce, tray_appearance, ICON_BOTH, ICON_CAM, ICON_IDLE,
+    ICON_MIC,
+};
 use overlay::Overlay;
 use teams::{Client as TeamsClient, RECONNECT_TIMER, WM_TEAMS_SOCKET, WM_TEAMS_STATE_CHANGED};
 
@@ -38,7 +41,7 @@ const ID_EXIT: u32 = 103;
 
 struct App {
     msg_hwnd: HWND,
-    hinstance: HINSTANCE,
+    icons: IconCache,
     overlay: Overlay,
     watcher: Watcher,
     enabled: bool,
@@ -87,10 +90,13 @@ fn main() -> Result<()> {
     let msg_hwnd = create_message_window(hinstance)?;
     let overlay = Overlay::new(hinstance)?;
     let watcher = Watcher::new()?;
+    let icons = IconCache::new(hinstance)?;
+
+    add_tray_icon(msg_hwnd, icons.get(ICON_IDLE))?;
 
     let app = App {
         msg_hwnd,
-        hinstance,
+        icons,
         overlay,
         watcher,
         enabled: true,
@@ -102,8 +108,6 @@ fn main() -> Result<()> {
     };
 
     APP.with(|cell| *cell.borrow_mut() = Some(app));
-
-    add_tray_icon(msg_hwnd, hinstance, ICON_IDLE)?;
 
     // Cache the TaskbarCreated message id so the WndProc can re-add the tray icon
     // if Explorer restarts (the broadcast is sent to all top-level windows).
@@ -207,7 +211,7 @@ fn apply_state(app: &mut App, new_state: DeviceState, bypass_debounce: bool) {
         // back on later.
         app.last_visible = (false, false);
         let (icon, tip) = tray_appearance(false, new_state.cam, mic_visible);
-        update_tray_icon(app.msg_hwnd, app.hinstance, icon, tip);
+        update_tray_icon(app.msg_hwnd, app.icons.get(icon), tip);
         return;
     }
 
@@ -243,7 +247,7 @@ fn apply_state(app: &mut App, new_state: DeviceState, bypass_debounce: bool) {
     app.overlay.set_colors(new_state.cam, mic_visible);
 
     let (icon, tip) = tray_appearance(true, new_state.cam, mic_visible);
-    update_tray_icon(app.msg_hwnd, app.hinstance, icon, tip);
+    update_tray_icon(app.msg_hwnd, app.icons.get(icon), tip);
 }
 
 fn create_message_window(hinstance: HINSTANCE) -> Result<HWND> {
@@ -372,7 +376,7 @@ extern "system" fn msg_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 // Explorer restarted — our tray icon was lost. Re-add it.
                 APP.with(|cell| {
                     if let Some(app) = cell.borrow().as_ref() {
-                        let _ = add_tray_icon(app.msg_hwnd, app.hinstance, ICON_IDLE);
+                        let _ = add_tray_icon(app.msg_hwnd, app.icons.get(ICON_IDLE));
                     }
                 });
                 LRESULT(0)
@@ -456,7 +460,7 @@ fn handle_menu(hwnd: HWND, id: u32) {
     }
 }
 
-fn add_tray_icon(hwnd: HWND, hinstance: HINSTANCE, icon_id: u16) -> Result<()> {
+fn add_tray_icon(hwnd: HWND, hicon: HICON) -> Result<()> {
     unsafe {
         let mut data = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -464,7 +468,7 @@ fn add_tray_icon(hwnd: HWND, hinstance: HINSTANCE, icon_id: u16) -> Result<()> {
             uID: TRAY_ID,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: TRAY_CALLBACK,
-            hIcon: load_icon(hinstance, icon_id)?,
+            hIcon: hicon,
             ..Default::default()
         };
         set_tip(&mut data, "HotMic");
@@ -483,20 +487,18 @@ fn add_tray_icon(hwnd: HWND, hinstance: HINSTANCE, icon_id: u16) -> Result<()> {
     }
 }
 
-fn update_tray_icon(hwnd: HWND, hinstance: HINSTANCE, icon_id: u16, tip: &str) {
+fn update_tray_icon(hwnd: HWND, hicon: HICON, tip: &str) {
     unsafe {
-        if let Ok(hicon) = load_icon(hinstance, icon_id) {
-            let mut data = NOTIFYICONDATAW {
-                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-                hWnd: hwnd,
-                uID: TRAY_ID,
-                uFlags: NIF_ICON | NIF_TIP,
-                hIcon: hicon,
-                ..Default::default()
-            };
-            set_tip(&mut data, tip);
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
-        }
+        let mut data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_ID,
+            uFlags: NIF_ICON | NIF_TIP,
+            hIcon: hicon,
+            ..Default::default()
+        };
+        set_tip(&mut data, tip);
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
     }
 }
 
@@ -512,10 +514,7 @@ fn remove_tray_icon(hwnd: HWND) {
     }
 }
 
-fn load_icon(
-    hinstance: HINSTANCE,
-    id: u16,
-) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
+fn load_icon(hinstance: HINSTANCE, id: u16) -> Result<HICON> {
     unsafe {
         // LoadIconMetric picks the .ico subimage that matches the current system
         // small-icon size for the active DPI, so high-DPI displays get the 32 px
@@ -525,6 +524,45 @@ fn load_icon(
             PCWSTR(id as usize as *const u16),
             LIM_SMALL,
         )
+    }
+}
+
+/// Cache of the four tray HICONs (idle/cam/mic/both) loaded once at startup.
+///
+/// Originally the binary called `LoadIconMetric` on every `update_tray_icon`,
+/// but per MSDN that API returns a non-shared icon handle that must be freed
+/// with `DestroyIcon`. We never freed them, and the 500 ms `BACKSTOP_TIMER`
+/// drives `apply_state` (and therefore `update_tray_icon`) unconditionally,
+/// so we leaked roughly 2 USER objects per second. After ~83 minutes the
+/// per-process USER quota of 10,000 was exhausted, at which point new
+/// `CreatePopupMenu`/`AppendMenuW` calls failed silently — the right-click
+/// tray menu would render blank — and `CreatePen`/`RoundRect` in the overlay
+/// stopped drawing the border, while the previously-set tray icon stayed
+/// stuck on its last color. Caching here loads exactly four HICONs for the
+/// life of the process, eliminating both the leak and the per-tick reload
+/// cost. The handles are intentionally not destroyed at process exit; the
+/// OS reclaims USER objects on termination.
+struct IconCache {
+    handles: [HICON; 4],
+}
+
+impl IconCache {
+    fn new(hinstance: HINSTANCE) -> Result<Self> {
+        Ok(Self {
+            handles: [
+                load_icon(hinstance, ICON_IDLE)?,
+                load_icon(hinstance, ICON_CAM)?,
+                load_icon(hinstance, ICON_MIC)?,
+                load_icon(hinstance, ICON_BOTH)?,
+            ],
+        })
+    }
+
+    fn get(&self, id: u16) -> HICON {
+        // ICON_* are 1..=4 by convention; clamp on out-of-range input rather
+        // than panicking from the WndProc.
+        let idx = (id as usize).saturating_sub(1).min(3);
+        self.handles[idx]
     }
 }
 
