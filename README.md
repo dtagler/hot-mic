@@ -2,14 +2,12 @@
   <img src="assets/logo.svg" alt="HotMic" width="120" height="120"/>
 </p>
 
-<div align="center">
-<pre style="display: inline-block; text-align: left; background: transparent !important; background-color: transparent !important; border: none !important; padding: 0;"><code style="background: transparent !important; background-color: transparent !important; padding: 0;">██╗  ██╗   ██████╗   ████████╗  ███╗   ███╗  ██╗   ██████╗
-██║  ██║  ██╔═══██╗  ╚══██╔══╝  ████╗ ████║  ██║  ██╔════╝
-███████║  ██║   ██║     ██║     ██╔████╔██║  ██║  ██║     
-██╔══██║  ██║   ██║     ██║     ██║╚██╔╝██║  ██║  ██║     
-██║  ██║  ╚██████╔╝     ██║     ██║ ╚═╝ ██║  ██║  ╚██████╗
-╚═╝  ╚═╝   ╚═════╝      ╚═╝     ╚═╝     ╚═╝  ╚═╝   ╚═════╝</code></pre>
-</div>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/title-dark.svg">
+    <img alt="HotMic" src="assets/title-light.svg" width="680">
+  </picture>
+</p>
 
 <p align="center"><em>Tray app that paints a thin colored border around your primary monitor whenever your camera or microphone is in use.</em></p>
 
