@@ -4,8 +4,8 @@ fn main() {
         .unwrap();
     println!("cargo:rerun-if-changed=app.rc");
     println!("cargo:rerun-if-changed=app.manifest");
-    println!("cargo:rerun-if-changed=icons/tray-idle.ico");
-    println!("cargo:rerun-if-changed=icons/tray-cam.ico");
-    println!("cargo:rerun-if-changed=icons/tray-mic.ico");
-    println!("cargo:rerun-if-changed=icons/tray-both.ico");
+    println!("cargo:rerun-if-changed=assets/icons/tray-idle.ico");
+    println!("cargo:rerun-if-changed=assets/icons/tray-cam.ico");
+    println!("cargo:rerun-if-changed=assets/icons/tray-mic.ico");
+    println!("cargo:rerun-if-changed=assets/icons/tray-both.ico");
 }

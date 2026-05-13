@@ -3,6 +3,7 @@
 mod autostart;
 mod detect;
 mod overlay;
+mod teams;
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -17,8 +18,9 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use detect::{DeviceState, Watcher};
-use hotmic::{should_start_debounce, tray_appearance, ICON_IDLE};
+use hotmic::{mic_should_show, should_start_debounce, tray_appearance, ICON_IDLE};
 use overlay::Overlay;
+use teams::{Client as TeamsClient, RECONNECT_TIMER, WM_TEAMS_SOCKET, WM_TEAMS_STATE_CHANGED};
 
 const TRAY_CALLBACK: u32 = WM_USER + 1;
 const BACKSTOP_TIMER: usize = 1;
@@ -42,6 +44,18 @@ struct App {
     enabled: bool,
     last_state: DeviceState,
     pending_off: bool,
+    /// Latest known Teams in-app mute state, fed by the Teams Local API
+    /// WebSocket client. Defaults to `false` whenever the WS isn't connected
+    /// (first run, classic Teams, IT-disabled API, connection drop) so the
+    /// detection rule degrades cleanly to the original registry-only behavior.
+    teams_muted_now: bool,
+    /// Last visible (cam, mic) the overlay was asked to paint. Used to make
+    /// the debounce decision based on what the user actually saw, not on the
+    /// raw registry state — a flip in `teams_muted_now` alone (registry
+    /// unchanged) must still arm the off-debounce, otherwise a quick
+    /// mute/unmute toggle would visibly flicker the border off.
+    last_visible: (bool, bool),
+    teams: TeamsClient,
 }
 
 thread_local! {
@@ -82,6 +96,9 @@ fn main() -> Result<()> {
         enabled: true,
         last_state: DeviceState::default(),
         pending_off: false,
+        teams_muted_now: false,
+        last_visible: (false, false),
+        teams: TeamsClient::new(msg_hwnd),
     };
 
     APP.with(|cell| *cell.borrow_mut() = Some(app));
@@ -101,15 +118,20 @@ fn main() -> Result<()> {
 
     APP.with(|cell| {
         if let Some(app) = cell.borrow_mut().as_mut() {
+            // Kick off the Teams WebSocket. Posts WM_TEAMS_SOCKET messages back
+            // to msg_hwnd as the connection progresses; degrades silently if
+            // Teams isn't running or the API is disabled.
+            app.teams.start();
             let s = app.watcher.scan();
-            apply_state(app, s);
+            apply_state(app, s, false);
         }
     });
 
     run_message_loop(msg_hwnd);
 
     APP.with(|cell| {
-        if let Some(app) = cell.borrow().as_ref() {
+        if let Some(app) = cell.borrow_mut().as_mut() {
+            app.teams.shutdown();
             remove_tray_icon(app.msg_hwnd);
         }
         *cell.borrow_mut() = None;
@@ -143,8 +165,9 @@ fn run_message_loop(_msg_hwnd: HWND) {
                 if let Some(app) = cell.borrow_mut().as_mut() {
                     app.watcher.arm_all();
                     let s = app.watcher.scan();
+                    app.teams_muted_now = app.teams.muted_now();
                     if !app.pending_off {
-                        apply_state(app, s);
+                        apply_state(app, s, false);
                     }
                 }
             });
@@ -168,19 +191,42 @@ fn run_message_loop(_msg_hwnd: HWND) {
     }
 }
 
-fn apply_state(app: &mut App, new_state: DeviceState) {
+fn apply_state(app: &mut App, new_state: DeviceState, bypass_debounce: bool) {
+    let mic_visible = mic_should_show(
+        new_state.mic_non_teams,
+        new_state.mic_teams,
+        app.teams_muted_now,
+    );
+
     if !app.enabled {
         app.overlay.force_hide();
         app.last_state = new_state;
-        let (icon, tip) = tray_appearance(false, new_state.cam, new_state.mic);
+        // `last_visible` is "what the overlay was asked to paint." When
+        // disabled we asked to paint nothing, so record (false, false). This
+        // keeps the debounce decision honest when the user toggles enabled
+        // back on later.
+        app.last_visible = (false, false);
+        let (icon, tip) = tray_appearance(false, new_state.cam, mic_visible);
         update_tray_icon(app.msg_hwnd, app.hinstance, icon, tip);
         return;
     }
 
-    let was_active = app.last_state.cam || app.last_state.mic;
-    let now_active = new_state.cam || new_state.mic;
+    // Debounce against what was actually painted, not against the raw registry
+    // state. A flip in `teams_muted_now` alone (registry unchanged) still
+    // counts as an active→idle transition and must be debounced, otherwise a
+    // quick mute/unmute toggle would visibly flicker the border off.
+    //
+    // `bypass_debounce` is set when this call is the DEBOUNCE_TIMER firing.
+    // The timer firing IS the commit point of the deferred off-transition,
+    // so we must skip the debounce check or we re-arm forever (the timer
+    // would call apply_state, `last_visible` would still say "border on,"
+    // and we'd re-enter the same active→idle branch indefinitely — the
+    // border would never actually turn off).
+    let (last_cam_visible, last_mic_visible) = app.last_visible;
+    let was_active = last_cam_visible || last_mic_visible;
+    let now_active = new_state.cam || mic_visible;
 
-    if should_start_debounce(was_active, now_active) {
+    if !bypass_debounce && should_start_debounce(was_active, now_active) {
         unsafe {
             // 150 ms off-debounce: just enough to ride through the brief stop/start
             // that some apps do during device negotiation, without feeling laggy.
@@ -193,9 +239,10 @@ fn apply_state(app: &mut App, new_state: DeviceState) {
 
     app.pending_off = false;
     app.last_state = new_state;
-    app.overlay.set_colors(new_state.cam, new_state.mic);
+    app.last_visible = (new_state.cam, mic_visible);
+    app.overlay.set_colors(new_state.cam, mic_visible);
 
-    let (icon, tip) = tray_appearance(true, new_state.cam, new_state.mic);
+    let (icon, tip) = tray_appearance(true, new_state.cam, mic_visible);
     update_tray_icon(app.msg_hwnd, app.hinstance, icon, tip);
 }
 
@@ -259,8 +306,9 @@ extern "system" fn msg_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     APP.with(|cell| {
                         if let Some(app) = cell.borrow_mut().as_mut() {
                             let s = app.watcher.scan();
+                            app.teams_muted_now = app.teams.muted_now();
                             if !app.pending_off {
-                                apply_state(app, s);
+                                apply_state(app, s, false);
                             }
                         }
                     });
@@ -270,10 +318,46 @@ extern "system" fn msg_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                         if let Some(app) = cell.borrow_mut().as_mut() {
                             app.pending_off = false;
                             let s = app.watcher.scan();
-                            apply_state(app, s);
+                            app.teams_muted_now = app.teams.muted_now();
+                            // bypass_debounce=true: the timer firing IS the
+                            // commit of the deferred off-transition. Without
+                            // this, apply_state would see was_active=true (from
+                            // last_visible) → now_active=false (still off) →
+                            // re-arm the same 150 ms timer forever, and the
+                            // border would never turn off.
+                            apply_state(app, s, true);
+                        }
+                    });
+                } else if id == RECONNECT_TIMER {
+                    APP.with(|cell| {
+                        if let Some(app) = cell.borrow_mut().as_mut() {
+                            app.teams.on_reconnect_timer();
                         }
                     });
                 }
+                LRESULT(0)
+            }
+            m if m == WM_TEAMS_SOCKET => {
+                APP.with(|cell| {
+                    if let Some(app) = cell.borrow_mut().as_mut() {
+                        app.teams.on_socket_event(wparam, lparam);
+                    }
+                });
+                LRESULT(0)
+            }
+            m if m == WM_TEAMS_STATE_CHANGED => {
+                // Teams reported a new isMuted/isInMeeting; recompute the
+                // border immediately rather than waiting for the next 500 ms
+                // backstop tick.
+                APP.with(|cell| {
+                    if let Some(app) = cell.borrow_mut().as_mut() {
+                        app.teams_muted_now = app.teams.muted_now();
+                        let s = app.watcher.scan();
+                        if !app.pending_off {
+                            apply_state(app, s, false);
+                        }
+                    }
+                });
                 LRESULT(0)
             }
             WM_DISPLAYCHANGE | WM_DPICHANGED => {
@@ -356,7 +440,8 @@ fn handle_menu(hwnd: HWND, id: u32) {
                 if let Some(app) = cell.borrow_mut().as_mut() {
                     app.enabled = !app.enabled;
                     let s = app.watcher.scan();
-                    apply_state(app, s);
+                    app.teams_muted_now = app.teams.muted_now();
+                    apply_state(app, s, false);
                 }
             });
         }

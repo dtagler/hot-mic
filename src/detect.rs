@@ -3,7 +3,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::*;
 
-use hotmic::{parse_in_use, wide_chars as wide};
+use hotmic::{is_teams_subkey, parse_in_use, wide_chars as wide};
 
 const WEBCAM_PATH: &str =
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam";
@@ -13,7 +13,13 @@ const MIC_PATH: &str =
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct DeviceState {
     pub cam: bool,
-    pub mic: bool,
+    /// True when at least one non-Teams app subkey holds the microphone.
+    pub mic_non_teams: bool,
+    /// True when at least one Teams subkey (`MSTeams_8wekyb3d8bbwe` or
+    /// classic Squirrel path) holds the microphone, regardless of whether
+    /// the user has muted in-app. The Teams Local API supplies the mute
+    /// state separately.
+    pub mic_teams: bool,
 }
 
 pub struct Watcher {
@@ -82,11 +88,14 @@ impl Watcher {
     }
 
     pub fn scan(&self) -> DeviceState {
+        let cam = any_in_use(HKEY_CURRENT_USER, WEBCAM_PATH)
+            || any_in_use(HKEY_LOCAL_MACHINE, WEBCAM_PATH);
+        let mic_hkcu = scan_mic(HKEY_CURRENT_USER, MIC_PATH);
+        let mic_hklm = scan_mic(HKEY_LOCAL_MACHINE, MIC_PATH);
         DeviceState {
-            cam: any_in_use(HKEY_CURRENT_USER, WEBCAM_PATH)
-                || any_in_use(HKEY_LOCAL_MACHINE, WEBCAM_PATH),
-            mic: any_in_use(HKEY_CURRENT_USER, MIC_PATH)
-                || any_in_use(HKEY_LOCAL_MACHINE, MIC_PATH),
+            cam,
+            mic_non_teams: mic_hkcu.0 || mic_hklm.0,
+            mic_teams: mic_hkcu.1 || mic_hklm.1,
         }
     }
 }
@@ -106,6 +115,7 @@ impl Drop for Watcher {
     }
 }
 
+/// Webcam path: simple any-in-use answer (we don't split cam by app).
 fn any_in_use(root: HKEY, path: &str) -> bool {
     let mut hkey = HKEY::default();
     let wide = wide(path);
@@ -118,6 +128,142 @@ fn any_in_use(root: HKEY, path: &str) -> bool {
         let _ = RegCloseKey(hkey);
     }
     result
+}
+
+/// Mic path: enumerate top-level app subkeys (and `NonPackaged` children),
+/// classify each as Teams or non-Teams via `lib::is_teams_subkey`, and
+/// return `(non_teams_active, teams_active)`. We stop scanning a branch as
+/// soon as a single in-use leaf is found, but always cover both branches
+/// so per-app fusion sees every active app.
+fn scan_mic(root: HKEY, path: &str) -> (bool, bool) {
+    let mut hkey = HKEY::default();
+    let wide_path = wide(path);
+    let r = unsafe {
+        RegOpenKeyExW(
+            root,
+            PCWSTR(wide_path.as_ptr()),
+            Some(0),
+            KEY_READ,
+            &mut hkey,
+        )
+    };
+    if r.is_err() {
+        return (false, false);
+    }
+    let mut non_teams = false;
+    let mut teams = false;
+    let mut i: u32 = 0;
+    loop {
+        let mut name = [0u16; 512];
+        let mut name_len: u32 = name.len() as u32;
+        let r = unsafe {
+            RegEnumKeyExW(
+                hkey,
+                i,
+                Some(PWSTR(name.as_mut_ptr())),
+                &mut name_len,
+                None,
+                Some(PWSTR::null()),
+                None,
+                None,
+            )
+        };
+        if r.is_err() {
+            if r == ERROR_MORE_DATA {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        let name_str = String::from_utf16_lossy(&name[..name_len as usize]);
+        if name_str.eq_ignore_ascii_case("NonPackaged") {
+            // Each child of NonPackaged is itself an app subkey (path-encoded).
+            let mut nphk = HKEY::default();
+            let r =
+                unsafe { RegOpenKeyExW(hkey, PCWSTR(name.as_ptr()), Some(0), KEY_READ, &mut nphk) };
+            if r.is_ok() {
+                classify_children(nphk, &mut non_teams, &mut teams);
+                unsafe {
+                    let _ = RegCloseKey(nphk);
+                }
+            }
+        } else {
+            // Top-level packaged app subkey (e.g. MSTeams_8wekyb3d8bbwe).
+            let mut sub = HKEY::default();
+            let r =
+                unsafe { RegOpenKeyExW(hkey, PCWSTR(name.as_ptr()), Some(0), KEY_READ, &mut sub) };
+            if r.is_ok() {
+                if walk(sub) {
+                    if is_teams_subkey(&name_str) {
+                        teams = true;
+                    } else {
+                        non_teams = true;
+                    }
+                }
+                unsafe {
+                    let _ = RegCloseKey(sub);
+                }
+            }
+        }
+        i += 1;
+        if non_teams && teams {
+            break;
+        }
+    }
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    (non_teams, teams)
+}
+
+/// Enumerate one level of app subkeys under a parent (used for NonPackaged),
+/// classify each by name, and recurse into the standard `walk` for per-app
+/// in-use detection.
+fn classify_children(parent: HKEY, non_teams: &mut bool, teams: &mut bool) {
+    let mut i: u32 = 0;
+    loop {
+        let mut name = [0u16; 512];
+        let mut name_len: u32 = name.len() as u32;
+        let r = unsafe {
+            RegEnumKeyExW(
+                parent,
+                i,
+                Some(PWSTR(name.as_mut_ptr())),
+                &mut name_len,
+                None,
+                Some(PWSTR::null()),
+                None,
+                None,
+            )
+        };
+        if r.is_err() {
+            if r == ERROR_MORE_DATA {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        let name_str = String::from_utf16_lossy(&name[..name_len as usize]);
+        let mut sub = HKEY::default();
+        let r =
+            unsafe { RegOpenKeyExW(parent, PCWSTR(name.as_ptr()), Some(0), KEY_READ, &mut sub) };
+        if r.is_ok() {
+            if walk(sub) {
+                if is_teams_subkey(&name_str) {
+                    *teams = true;
+                } else {
+                    *non_teams = true;
+                }
+            }
+            unsafe {
+                let _ = RegCloseKey(sub);
+            }
+        }
+        i += 1;
+        if *non_teams && *teams {
+            break;
+        }
+    }
 }
 
 fn walk(hkey: HKEY) -> bool {

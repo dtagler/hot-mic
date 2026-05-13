@@ -11,3 +11,6 @@ dist/*.lib
 
 # Claude Code session state
 .claude/
+
+# Local-only AI assistant config (not shared with the repo)
+.github/
