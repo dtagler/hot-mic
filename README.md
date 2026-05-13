@@ -4,8 +4,8 @@
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/title-dark.svg">
-    <img alt="HotMic" src="assets/title-light.svg" width="680">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/title-dark.png">
+    <img alt="HotMic" src="assets/title-light.png" width="680">
   </picture>
 </p>
 
