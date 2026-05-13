@@ -1,0 +1,10 @@
+# Rust build artifacts
+target/
+
+# Build outputs intended for distribution are tracked manually; ignore stray copies
+dist/*.pdb
+dist/*.exp
+dist/*.lib
+
+# playwright-cli session artifacts (snapshots, console logs from screenshot generation)
+.playwright-cli/

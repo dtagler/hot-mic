@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" role="img" aria-label="HotMic logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f1f1f"/>
+      <stop offset="1" stop-color="#0e0e0e"/>
+    </linearGradient>
+  </defs>
+  <rect width="320" height="320" rx="56" fill="url(#bg)"/>
+  <rect x="22" y="22" width="276" height="276" rx="44" fill="none" stroke="#9333EA" stroke-width="14"/>
+  <g fill="#ffffff" stroke="#ffffff" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="128" y="80" width="64" height="120" rx="32"/>
+    <path d="M 88 156 C 88 218, 232 218, 232 156" fill="none" stroke-width="14"/>
+    <line x1="160" y1="218" x2="160" y2="256" stroke-width="16"/>
+    <line x1="128" y1="256" x2="192" y2="256" stroke-width="16"/>
+  </g>
+</svg>
