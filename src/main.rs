@@ -212,8 +212,14 @@ fn create_message_window(hinstance: HINSTANCE) -> Result<HWND> {
         if RegisterClassExW(&wc) == 0 {
             return Err(Error::from_thread());
         }
+        // Hidden top-level window (no parent). We previously used HWND_MESSAGE,
+        // but message-only windows can't be foregrounded — so SetForegroundWindow
+        // before TrackPopupMenu silently failed and the popup rendered as a blank
+        // white box. They also don't receive RegisterWindowMessageW broadcasts
+        // like TaskbarCreated, which we rely on to re-add the tray icon after an
+        // Explorer restart.
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            WS_EX_TOOLWINDOW,
             class_name,
             w!("HotMic"),
             WINDOW_STYLE(0),
@@ -221,7 +227,7 @@ fn create_message_window(hinstance: HINSTANCE) -> Result<HWND> {
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            None,
             None,
             Some(hinstance),
             None,
@@ -336,6 +342,9 @@ fn show_menu(hwnd: HWND) {
             hwnd,
             None,
         );
+        // Documented MSDN workaround: post a benign message so the menu dismisses
+        // cleanly when the user clicks outside it.
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menu);
     }
 }
