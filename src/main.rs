@@ -7,6 +7,7 @@ mod teams;
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -19,8 +20,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use detect::{DeviceState, Watcher};
 use hotmic::{
-    mic_should_show, should_start_debounce, tray_appearance, ICON_BOTH, ICON_CAM, ICON_IDLE,
-    ICON_MIC,
+    should_cancel_pending_off, should_commit_pending_off_timer, should_defer_off_transition,
+    should_start_debounce, should_update_tray_icon, tray_appearance, visible_devices, ICON_BOTH,
+    ICON_CAM, ICON_IDLE, ICON_MIC,
 };
 use overlay::Overlay;
 use teams::{Client as TeamsClient, RECONNECT_TIMER, WM_TEAMS_SOCKET, WM_TEAMS_STATE_CHANGED};
@@ -29,6 +31,8 @@ const TRAY_CALLBACK: u32 = WM_USER + 1;
 const BACKSTOP_TIMER: usize = 1;
 const DEBOUNCE_TIMER: usize = 2;
 const TRAY_ID: u32 = 1;
+const DEBOUNCE_DURATION_MS: u32 = 150;
+const TRAY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// `TaskbarCreated` message id, returned by `RegisterWindowMessageW` and broadcast
 /// by Explorer when the shell restarts. We re-add our tray icon when we see it,
@@ -47,6 +51,7 @@ struct App {
     enabled: bool,
     last_state: DeviceState,
     pending_off: bool,
+    debounce_due: Option<Instant>,
     /// Latest known Teams in-app mute state, fed by the Teams Local API
     /// WebSocket client. Defaults to `false` whenever the WS isn't connected
     /// (first run, classic Teams, IT-disabled API, connection drop) so the
@@ -58,6 +63,9 @@ struct App {
     /// unchanged) must still arm the off-debounce, otherwise a quick
     /// mute/unmute toggle would visibly flicker the border off.
     last_visible: (bool, bool),
+    last_tray_icon: u16,
+    last_tray_tip: &'static str,
+    last_tray_refresh: Instant,
     teams: TeamsClient,
 }
 
@@ -92,7 +100,7 @@ fn main() -> Result<()> {
     let watcher = Watcher::new()?;
     let icons = IconCache::new(hinstance)?;
 
-    add_tray_icon(msg_hwnd, icons.get(ICON_IDLE))?;
+    add_tray_icon(msg_hwnd, icons.get(ICON_IDLE), "HotMic")?;
 
     let app = App {
         msg_hwnd,
@@ -102,8 +110,12 @@ fn main() -> Result<()> {
         enabled: true,
         last_state: DeviceState::default(),
         pending_off: false,
+        debounce_due: None,
         teams_muted_now: false,
         last_visible: (false, false),
+        last_tray_icon: ICON_IDLE,
+        last_tray_tip: "HotMic",
+        last_tray_refresh: Instant::now(),
         teams: TeamsClient::new(msg_hwnd),
     };
 
@@ -127,7 +139,7 @@ fn main() -> Result<()> {
             // Teams isn't running or the API is disabled.
             app.teams.start();
             let s = app.watcher.scan();
-            apply_state(app, s, false);
+            apply_scanned_state(app, s);
         }
     });
 
@@ -169,10 +181,7 @@ fn run_message_loop(_msg_hwnd: HWND) {
                 if let Some(app) = cell.borrow_mut().as_mut() {
                     app.watcher.arm_all();
                     let s = app.watcher.scan();
-                    app.teams_muted_now = app.teams.muted_now();
-                    if !app.pending_off {
-                        apply_state(app, s, false);
-                    }
+                    apply_scanned_state(app, s);
                 }
             });
         } else if wait.0 == count {
@@ -196,13 +205,21 @@ fn run_message_loop(_msg_hwnd: HWND) {
 }
 
 fn apply_state(app: &mut App, new_state: DeviceState, bypass_debounce: bool) {
-    let mic_visible = mic_should_show(
+    let (cam_visible, mic_visible) = visible_devices(
+        new_state.cam,
         new_state.mic_non_teams,
         new_state.mic_teams,
         app.teams_muted_now,
     );
 
     if !app.enabled {
+        if app.pending_off {
+            unsafe {
+                let _ = KillTimer(Some(app.msg_hwnd), DEBOUNCE_TIMER);
+            }
+            app.pending_off = false;
+            app.debounce_due = None;
+        }
         app.overlay.force_hide();
         app.last_state = new_state;
         // `last_visible` is "what the overlay was asked to paint." When
@@ -210,8 +227,8 @@ fn apply_state(app: &mut App, new_state: DeviceState, bypass_debounce: bool) {
         // keeps the debounce decision honest when the user toggles enabled
         // back on later.
         app.last_visible = (false, false);
-        let (icon, tip) = tray_appearance(false, new_state.cam, mic_visible);
-        update_tray_icon(app.msg_hwnd, app.icons.get(icon), tip);
+        let (icon, tip) = tray_appearance(false, cam_visible, mic_visible);
+        update_app_tray_icon(app, icon, tip);
         return;
     }
 
@@ -228,26 +245,109 @@ fn apply_state(app: &mut App, new_state: DeviceState, bypass_debounce: bool) {
     // border would never actually turn off).
     let (last_cam_visible, last_mic_visible) = app.last_visible;
     let was_active = last_cam_visible || last_mic_visible;
-    let now_active = new_state.cam || mic_visible;
+    let now_active = cam_visible || mic_visible;
 
-    if !bypass_debounce && should_start_debounce(was_active, now_active) {
-        unsafe {
+    let needs_off_debounce = !bypass_debounce && should_start_debounce(was_active, now_active);
+    let debounce_timer_armed = if needs_off_debounce {
+        let now = Instant::now();
+        let timer = unsafe {
             // 150 ms off-debounce: just enough to ride through the brief stop/start
             // that some apps do during device negotiation, without feeling laggy.
-            let _ = SetTimer(Some(app.msg_hwnd), DEBOUNCE_TIMER, 150, None);
+            SetTimer(
+                Some(app.msg_hwnd),
+                DEBOUNCE_TIMER,
+                DEBOUNCE_DURATION_MS,
+                None,
+            )
+        };
+        if timer != 0 {
+            app.debounce_due = Some(now + Duration::from_millis(u64::from(DEBOUNCE_DURATION_MS)));
+            true
+        } else {
+            false
         }
+    } else {
+        false
+    };
+
+    if should_defer_off_transition(
+        was_active,
+        now_active,
+        bypass_debounce,
+        debounce_timer_armed,
+    ) {
         app.pending_off = true;
         app.last_state = new_state;
         return;
     }
 
-    app.pending_off = false;
-    app.last_state = new_state;
-    app.last_visible = (new_state.cam, mic_visible);
-    app.overlay.set_colors(new_state.cam, mic_visible);
+    // If the debounce timer cannot be armed under resource pressure, fall
+    // through and commit the off-transition immediately rather than
+    // suppressing future applies.
 
-    let (icon, tip) = tray_appearance(true, new_state.cam, mic_visible);
-    update_tray_icon(app.msg_hwnd, app.icons.get(icon), tip);
+    app.pending_off = false;
+    app.debounce_due = None;
+    app.last_state = new_state;
+    app.last_visible = (cam_visible, mic_visible);
+    app.overlay.set_colors(cam_visible, mic_visible);
+
+    let (icon, tip) = tray_appearance(true, cam_visible, mic_visible);
+    update_app_tray_icon(app, icon, tip);
+}
+
+fn apply_scanned_state(app: &mut App, new_state: DeviceState) {
+    app.teams_muted_now = app.teams.muted_now();
+
+    if app.pending_off {
+        let (cam_visible, mic_visible) = visible_devices(
+            new_state.cam,
+            new_state.mic_non_teams,
+            new_state.mic_teams,
+            app.teams_muted_now,
+        );
+        if should_cancel_pending_off(cam_visible, mic_visible) {
+            unsafe {
+                let _ = KillTimer(Some(app.msg_hwnd), DEBOUNCE_TIMER);
+            }
+            app.pending_off = false;
+            app.debounce_due = None;
+            apply_state(app, new_state, false);
+        }
+        return;
+    }
+
+    apply_state(app, new_state, false);
+}
+
+fn current_tray_appearance(app: &App) -> (u16, &'static str) {
+    let (cam_visible, mic_visible) = visible_devices(
+        app.last_state.cam,
+        app.last_state.mic_non_teams,
+        app.last_state.mic_teams,
+        app.teams_muted_now,
+    );
+    tray_appearance(app.enabled, cam_visible, mic_visible)
+}
+
+fn update_app_tray_icon(app: &mut App, icon: u16, tip: &'static str) {
+    let refresh_due = app.last_tray_refresh.elapsed() >= TRAY_REFRESH_INTERVAL;
+    if !should_update_tray_icon(
+        app.last_tray_icon,
+        app.last_tray_tip,
+        icon,
+        tip,
+        refresh_due,
+    ) {
+        return;
+    }
+
+    if !update_tray_icon(app.msg_hwnd, app.icons.get(icon), tip) {
+        let _ = add_tray_icon(app.msg_hwnd, app.icons.get(icon), tip);
+    }
+
+    app.last_tray_icon = icon;
+    app.last_tray_tip = tip;
+    app.last_tray_refresh = Instant::now();
 }
 
 fn create_message_window(hinstance: HINSTANCE) -> Result<HWND> {
@@ -310,26 +410,31 @@ extern "system" fn msg_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     APP.with(|cell| {
                         if let Some(app) = cell.borrow_mut().as_mut() {
                             let s = app.watcher.scan();
-                            app.teams_muted_now = app.teams.muted_now();
-                            if !app.pending_off {
-                                apply_state(app, s, false);
-                            }
+                            apply_scanned_state(app, s);
                         }
                     });
                 } else if id == DEBOUNCE_TIMER {
-                    let _ = KillTimer(Some(hwnd), DEBOUNCE_TIMER);
                     APP.with(|cell| {
                         if let Some(app) = cell.borrow_mut().as_mut() {
-                            app.pending_off = false;
-                            let s = app.watcher.scan();
-                            app.teams_muted_now = app.teams.muted_now();
-                            // bypass_debounce=true: the timer firing IS the
-                            // commit of the deferred off-transition. Without
-                            // this, apply_state would see was_active=true (from
-                            // last_visible) → now_active=false (still off) →
-                            // re-arm the same 150 ms timer forever, and the
-                            // border would never turn off.
-                            apply_state(app, s, true);
+                            let debounce_due_reached =
+                                app.debounce_due.is_some_and(|due| Instant::now() >= due);
+                            if should_commit_pending_off_timer(
+                                app.pending_off,
+                                debounce_due_reached,
+                            ) {
+                                let _ = KillTimer(Some(hwnd), DEBOUNCE_TIMER);
+                                app.pending_off = false;
+                                app.debounce_due = None;
+                                let s = app.watcher.scan();
+                                app.teams_muted_now = app.teams.muted_now();
+                                // bypass_debounce=true: the timer firing IS the
+                                // commit of the deferred off-transition. Without
+                                // this, apply_state would see was_active=true (from
+                                // last_visible) → now_active=false (still off) →
+                                // re-arm the same 150 ms timer forever, and the
+                                // border would never turn off.
+                                apply_state(app, s, true);
+                            }
                         }
                     });
                 } else if id == RECONNECT_TIMER {
@@ -355,11 +460,8 @@ extern "system" fn msg_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 // backstop tick.
                 APP.with(|cell| {
                     if let Some(app) = cell.borrow_mut().as_mut() {
-                        app.teams_muted_now = app.teams.muted_now();
                         let s = app.watcher.scan();
-                        if !app.pending_off {
-                            apply_state(app, s, false);
-                        }
+                        apply_scanned_state(app, s);
                     }
                 });
                 LRESULT(0)
@@ -375,8 +477,13 @@ extern "system" fn msg_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             m if Some(m) == TASKBAR_CREATED.get().copied() => {
                 // Explorer restarted — our tray icon was lost. Re-add it.
                 APP.with(|cell| {
-                    if let Some(app) = cell.borrow().as_ref() {
-                        let _ = add_tray_icon(app.msg_hwnd, app.icons.get(ICON_IDLE));
+                    if let Some(app) = cell.borrow_mut().as_mut() {
+                        let (icon, tip) = current_tray_appearance(app);
+                        if add_tray_icon(app.msg_hwnd, app.icons.get(icon), tip).is_ok() {
+                            app.last_tray_icon = icon;
+                            app.last_tray_tip = tip;
+                            app.last_tray_refresh = Instant::now();
+                        }
                     }
                 });
                 LRESULT(0)
@@ -460,7 +567,7 @@ fn handle_menu(hwnd: HWND, id: u32) {
     }
 }
 
-fn add_tray_icon(hwnd: HWND, hicon: HICON) -> Result<()> {
+fn add_tray_icon(hwnd: HWND, hicon: HICON, tip: &str) -> Result<()> {
     unsafe {
         let mut data = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -471,7 +578,7 @@ fn add_tray_icon(hwnd: HWND, hicon: HICON) -> Result<()> {
             hIcon: hicon,
             ..Default::default()
         };
-        set_tip(&mut data, "HotMic");
+        set_tip(&mut data, tip);
 
         // Shell_NotifyIconW can transiently fail during shell startup or restart
         // with ERROR_TIMEOUT. Retry a few times with a short backoff before giving up.
@@ -487,7 +594,7 @@ fn add_tray_icon(hwnd: HWND, hicon: HICON) -> Result<()> {
     }
 }
 
-fn update_tray_icon(hwnd: HWND, hicon: HICON, tip: &str) {
+fn update_tray_icon(hwnd: HWND, hicon: HICON, tip: &str) -> bool {
     unsafe {
         let mut data = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -498,7 +605,7 @@ fn update_tray_icon(hwnd: HWND, hicon: HICON, tip: &str) {
             ..Default::default()
         };
         set_tip(&mut data, tip);
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+        Shell_NotifyIconW(NIM_MODIFY, &data).as_bool()
     }
 }
 

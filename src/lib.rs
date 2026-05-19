@@ -64,6 +64,80 @@ pub fn should_start_debounce(was_active: bool, now_active: bool) -> bool {
     was_active && !now_active
 }
 
+/// True when the off-debounce path should defer an active to idle transition.
+/// If the timer cannot be armed, callers must commit immediately rather than
+/// leaving `pending_off` set forever.
+pub fn should_defer_off_transition(
+    was_active: bool,
+    now_active: bool,
+    bypass_debounce: bool,
+    debounce_timer_armed: bool,
+) -> bool {
+    !bypass_debounce && debounce_timer_armed && should_start_debounce(was_active, now_active)
+}
+
+/// True when a pending off-debounce should be canceled because a fresh scan
+/// says the overlay is active again before the deferred commit fires.
+pub fn should_cancel_pending_off(cam_visible: bool, mic_visible: bool) -> bool {
+    cam_visible || mic_visible
+}
+
+/// True when a DEBOUNCE_TIMER message should commit the deferred off state for
+/// the currently pending debounce. KillTimer does not remove an already-posted
+/// WM_TIMER, so stale messages must be ignored until the active debounce's own
+/// deadline has arrived.
+pub fn should_commit_pending_off_timer(pending_off: bool, debounce_due_reached: bool) -> bool {
+    pending_off && debounce_due_reached
+}
+
+/// True when the tray icon needs a shell update. The periodic refresh is a
+/// heartbeat that lets HotMic recover if Explorer loses the icon without
+/// broadcasting TaskbarCreated.
+pub fn should_update_tray_icon(
+    last_icon: u16,
+    last_tip: &str,
+    next_icon: u16,
+    next_tip: &str,
+    refresh_due: bool,
+) -> bool {
+    last_icon != next_icon || last_tip != next_tip || refresh_due
+}
+
+/// True when an active overlay should recreate its HWND because DWM cloaked it,
+/// usually after a virtual-desktop transition.
+pub fn should_recreate_cloaked_overlay(show: bool, dwm_cloaked: bool) -> bool {
+    show && dwm_cloaked
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlayVisibilityPlan {
+    pub recreate: bool,
+    pub show_window: bool,
+    pub repair: bool,
+}
+
+/// Describes the Win32 overlay repair operations needed for a desired visible
+/// state. Kept pure so the long-running visibility decisions stay unit-tested.
+pub fn overlay_visibility_plan(
+    show: bool,
+    currently_shown: bool,
+    dwm_cloaked: bool,
+) -> OverlayVisibilityPlan {
+    if !show {
+        return OverlayVisibilityPlan {
+            recreate: false,
+            show_window: false,
+            repair: false,
+        };
+    }
+
+    OverlayVisibilityPlan {
+        recreate: should_recreate_cloaked_overlay(show, dwm_cloaked),
+        show_window: !currently_shown || dwm_cloaked,
+        repair: true,
+    }
+}
+
 /// Parses LastUsedTimeStop bytes. `0` means the device is in use right now.
 /// Other values (real FILETIMEs) mean it was released. Wrong size = treat as not in use.
 pub fn parse_in_use(bytes: &[u8], size: usize) -> bool {
@@ -117,6 +191,20 @@ pub fn is_teams_subkey(name: &str) -> bool {
 /// only when the API confirms the user has muted.
 pub fn mic_should_show(non_teams_active: bool, teams_active: bool, teams_muted_now: bool) -> bool {
     non_teams_active || (teams_active && !teams_muted_now)
+}
+
+/// Final visible device tuple after fusing raw registry state with Teams mute.
+/// Keeps camera visibility independent of any Teams mic suppression.
+pub fn visible_devices(
+    cam_active: bool,
+    mic_non_teams_active: bool,
+    mic_teams_active: bool,
+    teams_muted_now: bool,
+) -> (bool, bool) {
+    (
+        cam_active,
+        mic_should_show(mic_non_teams_active, mic_teams_active, teams_muted_now),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +728,169 @@ mod tests {
         // but the caller short-circuits it on the deferred-commit path.
         let arm_again = !bypass_debounce && should_start_debounce(was_active, now_active);
         assert!(!arm_again);
+    }
+
+    #[test]
+    fn off_debounce_defers_when_timer_is_armed() {
+        assert!(should_defer_off_transition(true, false, false, true));
+    }
+
+    #[test]
+    fn off_debounce_commits_when_timer_fails() {
+        assert!(!should_defer_off_transition(true, false, false, false));
+    }
+
+    #[test]
+    fn off_debounce_commit_path_ignores_active_to_idle() {
+        assert!(!should_defer_off_transition(true, false, true, true));
+    }
+
+    #[test]
+    fn off_debounce_does_not_defer_when_state_stays_active_or_idle() {
+        assert!(!should_defer_off_transition(true, true, false, true));
+        assert!(!should_defer_off_transition(false, false, false, true));
+        assert!(!should_defer_off_transition(false, true, false, true));
+    }
+
+    #[test]
+    fn pending_off_cancels_when_device_becomes_active_again() {
+        assert!(should_cancel_pending_off(true, false));
+        assert!(should_cancel_pending_off(false, true));
+        assert!(should_cancel_pending_off(true, true));
+    }
+
+    #[test]
+    fn pending_off_stays_pending_while_still_idle() {
+        assert!(!should_cancel_pending_off(false, false));
+    }
+
+    #[test]
+    fn pending_off_timer_commits_only_while_still_pending() {
+        assert!(should_commit_pending_off_timer(true, true));
+    }
+
+    #[test]
+    fn stale_pending_off_timer_is_ignored_after_cancel() {
+        assert!(!should_commit_pending_off_timer(false, true));
+        assert!(!should_commit_pending_off_timer(false, false));
+    }
+
+    #[test]
+    fn stale_pending_off_timer_does_not_commit_new_debounce_early() {
+        assert!(!should_commit_pending_off_timer(true, false));
+    }
+
+    #[test]
+    fn visible_devices_keep_camera_on_when_teams_mic_is_muted() {
+        assert_eq!(visible_devices(true, false, true, true), (true, false));
+    }
+
+    #[test]
+    fn visible_devices_show_both_when_camera_and_unmuted_teams_mic_are_active() {
+        assert_eq!(visible_devices(true, false, true, false), (true, true));
+    }
+
+    #[test]
+    fn visible_devices_keep_mic_on_when_non_teams_app_is_active() {
+        assert_eq!(visible_devices(false, true, true, true), (false, true));
+    }
+
+    #[test]
+    fn tray_update_skips_unchanged_state_until_heartbeat() {
+        assert!(!should_update_tray_icon(
+            ICON_BOTH,
+            "HotMic: camera + microphone in use",
+            ICON_BOTH,
+            "HotMic: camera + microphone in use",
+            false
+        ));
+    }
+
+    #[test]
+    fn tray_update_runs_when_state_changes() {
+        assert!(should_update_tray_icon(
+            ICON_BOTH,
+            "HotMic: camera + microphone in use",
+            ICON_MIC,
+            "HotMic: microphone in use",
+            false
+        ));
+        assert!(should_update_tray_icon(
+            ICON_CAM, "same tip", ICON_MIC, "same tip", false
+        ));
+        assert!(should_update_tray_icon(
+            ICON_MIC,
+            "HotMic: microphone in use",
+            ICON_MIC,
+            "HotMic (disabled)",
+            false
+        ));
+    }
+
+    #[test]
+    fn tray_update_runs_on_periodic_heartbeat() {
+        assert!(should_update_tray_icon(
+            ICON_BOTH,
+            "HotMic: camera + microphone in use",
+            ICON_BOTH,
+            "HotMic: camera + microphone in use",
+            true
+        ));
+    }
+
+    #[test]
+    fn cloaked_overlay_recreates_only_while_active() {
+        assert!(should_recreate_cloaked_overlay(true, true));
+        assert!(!should_recreate_cloaked_overlay(true, false));
+        assert!(!should_recreate_cloaked_overlay(false, true));
+    }
+
+    #[test]
+    fn overlay_plan_repairs_active_window_even_when_already_shown() {
+        assert_eq!(
+            overlay_visibility_plan(true, true, false),
+            OverlayVisibilityPlan {
+                recreate: false,
+                show_window: false,
+                repair: true
+            }
+        );
+    }
+
+    #[test]
+    fn overlay_plan_shows_and_repairs_active_hidden_window() {
+        assert_eq!(
+            overlay_visibility_plan(true, false, false),
+            OverlayVisibilityPlan {
+                recreate: false,
+                show_window: true,
+                repair: true
+            }
+        );
+    }
+
+    #[test]
+    fn overlay_plan_recreates_shows_and_repairs_active_cloaked_window() {
+        assert_eq!(
+            overlay_visibility_plan(true, true, true),
+            OverlayVisibilityPlan {
+                recreate: true,
+                show_window: true,
+                repair: true
+            }
+        );
+    }
+
+    #[test]
+    fn overlay_plan_does_nothing_when_idle_even_if_cloaked() {
+        assert_eq!(
+            overlay_visibility_plan(false, true, true),
+            OverlayVisibilityPlan {
+                recreate: false,
+                show_window: false,
+                repair: false
+            }
+        );
     }
 
     #[test]

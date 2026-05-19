@@ -1,10 +1,16 @@
+use std::ffi::c_void;
+
 use windows::core::*;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use hotmic::{border_thickness_px, corner_radius_px, COLOR_BLUE, COLOR_PURPLE, COLOR_RED};
+use hotmic::{
+    border_thickness_px, corner_radius_px, overlay_visibility_plan, COLOR_BLUE, COLOR_PURPLE,
+    COLOR_RED,
+};
 
 const CLASS_NAME: PCWSTR = w!("HotMicOverlay");
 
@@ -37,6 +43,7 @@ struct OverlayState {
 }
 
 pub struct Overlay {
+    hinstance: HINSTANCE,
     hwnd: HWND,
     // Boxed so the heap address stays stable for the WndProc to read via GWLP_USERDATA.
     state: Box<OverlayState>,
@@ -45,37 +52,16 @@ pub struct Overlay {
 impl Overlay {
     pub fn new(hinstance: HINSTANCE) -> Result<Self> {
         register_class(hinstance)?;
-        let hwnd = unsafe {
-            CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-                CLASS_NAME,
-                w!("HotMic"),
-                WS_POPUP,
-                0,
-                0,
-                0,
-                0,
-                None,
-                None,
-                Some(hinstance),
-                None,
-            )?
-        };
-        unsafe {
-            // Start fully transparent (alpha = 0), with color-key masking magenta.
-            // Both LWA_COLORKEY and LWA_ALPHA so alpha can be animated independently.
-            let _ = SetLayeredWindowAttributes(
-                hwnd,
-                COLORREF(TRANSPARENT_KEY),
-                0,
-                LWA_COLORKEY | LWA_ALPHA,
-            );
-        }
+        let hwnd = create_overlay_window(hinstance)?;
         let state = Box::new(OverlayState::default());
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state.as_ref() as *const _ as isize);
         }
-        let mut o = Self { hwnd, state };
+        let mut o = Self {
+            hinstance,
+            hwnd,
+            state,
+        };
         o.reposition();
         Ok(o)
     }
@@ -85,12 +71,17 @@ impl Overlay {
         self.state.target_alpha = if show { 255 } else { 0 };
 
         if show {
+            let plan = overlay_visibility_plan(show, self.state.shown, is_dwm_cloaked(self.hwnd));
+            if plan.recreate {
+                self.recreate_on_current_desktop();
+            }
+
             // Going to a visible state: snap paint colors to the new state
             // immediately (so a cam→both transition swaps color crisply).
             self.state.paint_cam = cam;
             self.state.paint_mic = mic;
 
-            if !self.state.shown {
+            if plan.show_window {
                 // Window is hidden (either first-ever or after a completed
                 // fade-out). Start invisible and fade up.
                 self.state.current_alpha = 0;
@@ -105,13 +96,19 @@ impl Overlay {
                 }
                 self.state.shown = true;
             }
+
+            if plan.repair {
+                self.repair_visible_window();
+            }
         }
         // For show=false: keep paint_cam/paint_mic as they were, so the
         // existing border color persists while the fade-out runs.
 
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, true);
-            let _ = SetTimer(Some(self.hwnd), FADE_TIMER, FADE_TICK_MS, None);
+            if SetTimer(Some(self.hwnd), FADE_TIMER, FADE_TICK_MS, None) == 0 {
+                self.snap_to_target_alpha();
+            }
         }
     }
 
@@ -148,6 +145,65 @@ impl Overlay {
             let _ = InvalidateRect(Some(self.hwnd), None, true);
         }
     }
+
+    fn repair_visible_window(&mut self) {
+        let (left, top, width, height, _dpi) = primary_monitor_bounds();
+        unsafe {
+            let _ = SetLayeredWindowAttributes(
+                self.hwnd,
+                COLORREF(TRANSPARENT_KEY),
+                self.state.current_alpha,
+                LWA_COLORKEY | LWA_ALPHA,
+            );
+            // Teams call/share windows, virtual-desktop transitions, and display
+            // topology changes can leave an otherwise active overlay hidden,
+            // behind another topmost window, or at stale bounds. The 500 ms
+            // backstop tick calls this while active, so those states self-heal.
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                left,
+                top,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+            );
+        }
+    }
+
+    fn recreate_on_current_desktop(&mut self) {
+        let Ok(new_hwnd) = create_overlay_window(self.hinstance) else {
+            return;
+        };
+        unsafe {
+            SetWindowLongPtrW(
+                new_hwnd,
+                GWLP_USERDATA,
+                self.state.as_ref() as *const _ as isize,
+            );
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+            let _ = DestroyWindow(self.hwnd);
+        }
+        self.hwnd = new_hwnd;
+        self.state.shown = false;
+        self.state.current_alpha = 0;
+        self.reposition();
+    }
+
+    fn snap_to_target_alpha(&mut self) {
+        self.state.current_alpha = self.state.target_alpha;
+        unsafe {
+            let _ = SetLayeredWindowAttributes(
+                self.hwnd,
+                COLORREF(TRANSPARENT_KEY),
+                self.state.current_alpha,
+                LWA_COLORKEY | LWA_ALPHA,
+            );
+            if self.state.current_alpha == 0 {
+                finish_fade_out(self.hwnd, &mut self.state);
+            }
+        }
+    }
 }
 
 impl Drop for Overlay {
@@ -177,6 +233,58 @@ fn primary_monitor_bounds() -> (i32, i32, i32, i32, u32) {
         let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
         (r.left, r.top, r.right - r.left, r.bottom - r.top, dpi_x)
     }
+}
+
+fn create_overlay_window(hinstance: HINSTANCE) -> Result<HWND> {
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            CLASS_NAME,
+            w!("HotMic"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(hinstance),
+            None,
+        )?
+    };
+    unsafe {
+        // Start fully transparent (alpha = 0), with color-key masking magenta.
+        // Both LWA_COLORKEY and LWA_ALPHA so alpha can be animated independently.
+        let _ = SetLayeredWindowAttributes(
+            hwnd,
+            COLORREF(TRANSPARENT_KEY),
+            0,
+            LWA_COLORKEY | LWA_ALPHA,
+        );
+    }
+    Ok(hwnd)
+}
+
+fn is_dwm_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked: u32 = 0;
+    let r = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut _ as *mut c_void,
+            std::mem::size_of_val(&cloaked) as u32,
+        )
+    };
+    r.is_ok() && cloaked != 0
+}
+
+unsafe fn finish_fade_out(hwnd: HWND, state: &mut OverlayState) {
+    // Fully faded out. Hide the window and clear paint state so the next
+    // set_colors starts a clean fade-in.
+    state.paint_cam = false;
+    state.paint_mic = false;
+    state.shown = false;
+    let _ = ShowWindow(hwnd, SW_HIDE);
 }
 
 fn dpi_for(hwnd: HWND) -> u32 {
@@ -263,12 +371,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 if delta == 0 {
                     let _ = KillTimer(Some(hwnd), FADE_TIMER);
                     if state.current_alpha == 0 {
-                        // Fully faded out. Hide the window and clear paint state
-                        // so the next set_colors starts a clean fade-in.
-                        state.paint_cam = false;
-                        state.paint_mic = false;
-                        state.shown = false;
-                        let _ = ShowWindow(hwnd, SW_HIDE);
+                        finish_fade_out(hwnd, state);
                     }
                     return LRESULT(0);
                 }
