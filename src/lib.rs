@@ -185,10 +185,53 @@ pub fn is_teams_subkey(name: &str) -> bool {
     lower.contains("#microsoft#teams#current#teams.exe")
 }
 
-/// Final mic-show decision after fusing registry attribution with the
-/// authoritative Teams Local API mute state. The OR keeps the border on
-/// whenever any non-Teams app holds the mic; Teams' branch is suppressed
-/// only when the API confirms the user has muted.
+/// Interpret the accessible name of Teams' local microphone button.
+///
+/// The button describes the action it will perform, so "Unmute" means the
+/// microphone is currently muted and "Mute" means it is currently live.
+pub fn parse_teams_mic_button_name(name: &str) -> Option<bool> {
+    let action = name.split_whitespace().next()?;
+    if action.eq_ignore_ascii_case("unmute") {
+        Some(true)
+    } else if action.eq_ignore_ascii_case("mute") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Combine microphone-button states from multiple Teams windows. A live
+/// result wins conflicts so stale duplicate windows can never hide the border.
+pub fn combine_teams_mic_button_states(states: &[Option<bool>]) -> Option<bool> {
+    if states.contains(&Some(false)) {
+        Some(false)
+    } else if !states.is_empty() && states.iter().all(|state| *state == Some(true)) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Prefer an authoritative Local API state. Query UI Automation only while
+/// Teams holds the mic and the API is unavailable, then fail safe to mic-live.
+pub fn resolve_teams_muted<F>(
+    local_api_muted: Option<bool>,
+    teams_active: bool,
+    ui_automation_muted: F,
+) -> bool
+where
+    F: FnOnce() -> Option<bool>,
+{
+    match local_api_muted {
+        Some(muted) => muted,
+        None if teams_active => ui_automation_muted().unwrap_or(false),
+        None => false,
+    }
+}
+
+/// Final mic-show decision after fusing registry attribution with the resolved
+/// Teams mute state. The OR keeps the border on whenever any non-Teams app
+/// holds the mic; Teams' branch is suppressed only when Teams is known muted.
 pub fn mic_should_show(non_teams_active: bool, teams_active: bool, teams_muted_now: bool) -> bool {
     non_teams_active || (teams_active && !teams_muted_now)
 }
@@ -1005,6 +1048,77 @@ mod tests {
         assert!(!is_teams_subkey(""));
         assert!(!is_teams_subkey("Microsoft.WindowsCamera_8wekyb3d8bbwe"));
         assert!(!is_teams_subkey("Microsoft.SkypeApp_kzf8qxf38zg5c"));
+    }
+
+    #[test]
+    fn teams_unmute_button_means_the_local_mic_is_muted() {
+        assert_eq!(parse_teams_mic_button_name("Unmute mic"), Some(true));
+        assert_eq!(
+            parse_teams_mic_button_name("Unmute microphone (Ctrl+Shift+M)"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn teams_mute_button_means_the_local_mic_is_live() {
+        assert_eq!(parse_teams_mic_button_name("Mute mic"), Some(false));
+    }
+
+    #[test]
+    fn unrelated_accessibility_names_do_not_invent_a_mute_state() {
+        assert_eq!(parse_teams_mic_button_name("Alex Example, muted"), None);
+        assert_eq!(parse_teams_mic_button_name(""), None);
+    }
+
+    #[test]
+    fn conflicting_teams_windows_fail_safe_to_mic_live() {
+        assert_eq!(
+            combine_teams_mic_button_states(&[Some(true), Some(false)]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn teams_windows_report_muted_only_when_every_button_does() {
+        assert_eq!(combine_teams_mic_button_states(&[None, Some(true)]), None);
+        assert_eq!(
+            combine_teams_mic_button_states(&[Some(true), Some(true)]),
+            Some(true)
+        );
+        assert_eq!(combine_teams_mic_button_states(&[None, None]), None);
+    }
+
+    #[test]
+    fn local_api_state_wins_over_accessibility_fallback() {
+        assert!(!resolve_teams_muted(Some(false), true, || {
+            panic!("authoritative Local API state must skip UI Automation")
+        }));
+        assert!(resolve_teams_muted(Some(true), true, || {
+            panic!("authoritative Local API state must skip UI Automation")
+        }));
+    }
+
+    #[test]
+    fn accessibility_state_fills_local_api_gap() {
+        assert!(resolve_teams_muted(None, true, || Some(true)));
+        assert!(!resolve_teams_muted(None, true, || Some(false)));
+    }
+
+    #[test]
+    fn inactive_teams_skips_accessibility_lookup() {
+        let mut queried = false;
+        let muted = resolve_teams_muted(None, false, || {
+            queried = true;
+            Some(true)
+        });
+
+        assert!(!muted);
+        assert!(!queried);
+    }
+
+    #[test]
+    fn unavailable_teams_signals_fail_safe_to_mic_live() {
+        assert!(!resolve_teams_muted(None, true, || None));
     }
 
     // -----------------------------------------------------------------------

@@ -17,8 +17,8 @@ pub struct DeviceState {
     pub mic_non_teams: bool,
     /// True when at least one Teams subkey (`MSTeams_8wekyb3d8bbwe` or
     /// classic Squirrel path) holds the microphone, regardless of whether
-    /// the user has muted in-app. The Teams Local API supplies the mute
-    /// state separately.
+    /// the user has muted in-app. The Teams detector supplies the mute state
+    /// separately.
     pub mic_teams: bool,
 }
 

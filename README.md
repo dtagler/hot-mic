@@ -17,7 +17,7 @@
   <img src="https://img.shields.io/badge/arch-x64%20%E2%80%A2%20ARM64%20(via%20x64%20emulation)-8957E5?logo=windows&logoColor=white" alt="Architecture"/>
   <img src="https://img.shields.io/badge/built%20with-Rust-CE422B?logo=rust&logoColor=white" alt="Language"/>
   <img src="https://img.shields.io/badge/-Docker-2496ED?logo=docker&logoColor=white" alt="Docker"/>
-  <img src="https://img.shields.io/badge/tests-83%20passing-brightgreen" alt="Tests"/>
+  <img src="https://img.shields.io/badge/tests-112%20passing-brightgreen" alt="Tests"/>
   <img src="https://img.shields.io/badge/license-MIT-brightgreen" alt="License"/>
 </p>
 
@@ -65,59 +65,56 @@ The tray menu (right-click) has:
 
 ## ![Microsoft Teams logo](assets/microsoft-teams.svg) Microsoft Teams Setup
 
-If you use Teams, you want this. Otherwise HotMic will paint the red mic border for the entire duration of every Teams call: Teams keeps the WASAPI capture stream open while you're muted (so unmute is zero-latency), so Windows reports the mic as "in use" the whole time. HotMic fixes that by asking Teams directly for your real mute state via the **Teams Local API**, but that API is gated behind a per-user opt-in plus a one-time approval banner.
+Teams keeps its microphone capture stream open while you are muted, so Windows reports the mic as "in use" for the entire call. HotMic resolves the real in-app mute state from either the Teams Local API or a read-only Windows UI Automation fallback.
 
-### Prerequisites
+### Current Teams Builds
 
-- **New Teams** (the MSIX build). Classic Teams (`Teams.exe` Squirrel install) and Teams Personal don't expose the API; HotMic falls back to registry-only behavior for those, meaning the red border will stay on for the whole call.
-- **Third-party API not disabled by IT policy.** If your managed device blocks it, the toggle in Step 1 will be greyed out and there's nothing HotMic can do.
+No setup is required for new Teams builds that no longer show **Manage API** under **Settings > Privacy**. HotMic reads the meeting microphone button through Windows UI Automation without clicking it or sending commands. Teams exposes that button with the stable automation ID `microphone-button`; its accessible action is `Unmute mic` while muted and `Mute mic` while live.
 
-### Step 1: Enable the API In Teams
+The fallback is checked by the existing 500 ms backstop timer. The red border therefore clears within about 650 ms after muting and returns within about 500 ms after unmuting.
 
-1. Open Teams.
-2. Click the three-dot menu next to your profile picture (top right) > **Settings**.
-3. Go to **Settings > Privacy**.
-4. Find the section labeled something like *Manage API*, *Third-party app API*, or *Local API*. The exact wording has changed across Teams versions; look for any toggle that mentions "third-party" and "API".
-5. Toggle it **on**.
+### Older Teams Builds With Manage API
 
-### Step 2: Approve HotMic
+If Teams still shows **Manage API** under **Settings > Privacy**, HotMic prefers that event-driven API:
 
-1. Make sure HotMic is running (microphone icon visible in the system tray).
-2. Start a Teams meeting. A **Meet now** session works for testing; you don't need to invite anyone.
-3. Once you're in the meeting, Teams will show an **Allow** banner inside its own window asking whether HotMic can connect to its local API. Click **Allow**.
+1. Open **Settings > Privacy > Manage API** and turn on **Enable API**.
+2. Start a Teams meeting while HotMic is running.
+3. Click **Allow** when Teams asks whether HotMic may connect.
 
-That's it. The red border now clears within ~150 ms whenever you mute in a Teams call, and comes back when you unmute. The Allow banner only appears once: HotMic stores Teams' token DPAPI-wrapped at `%LOCALAPPDATA%\HotMic\teams.token`, and subsequent runs reconnect silently with no UI.
+The Local API sends mute changes immediately. Its Allow banner appears once; HotMic stores the returned token DPAPI-wrapped at `%LOCALAPPDATA%\HotMic\teams.token` and reconnects silently afterward.
 
-### Re-Pairing
+### Local API Re-Pairing
 
-HotMic detects token rejection automatically and re-pairs without any manual action when:
+For older builds that still expose the Local API, HotMic detects token rejection and re-pairs when:
 
 - You removed HotMic from Teams' allowed-apps list.
 - You signed into Teams as a different user.
 - You reinstalled Teams.
 
-In any of those cases, Teams resumes sending `canPair:true` the next time you're in a meeting, HotMic discards the stale token, and the Allow banner appears again. Click Allow once more.
+Teams resumes sending `canPair:true` in the next meeting, HotMic discards the stale token, and the Allow banner appears again. Click **Allow** once more.
 
-To force a fresh pair manually: delete `%LOCALAPPDATA%\HotMic\teams.token`, restart HotMic, and start a Teams meeting to trigger the banner.
+To force a fresh Local API pair, delete `%LOCALAPPDATA%\HotMic\teams.token`, restart HotMic, and start a meeting. This is unnecessary when Teams no longer shows **Manage API**.
 
 ### If the Border Still Doesn't Clear On Mute
 
-1. **Are you in a meeting?** Teams only emits mute updates while `isInMeeting=true`. Outside meetings the API is mostly idle by design.
-2. **Did you click Allow?** Check Teams' Privacy settings: if HotMic isn't in the allowed-apps list, the pair banner was either missed or denied. Re-trigger it by starting a Meet-now while HotMic is running.
-3. **Are you on new Teams?** Right-click the Teams icon in the system tray and check the version. If you're on Classic Teams (`Teams.exe`) or Teams Personal, the API isn't available and the red border will keep its registry-only behavior for the whole call.
-4. **Capture a debug log.** Stop HotMic, then re-launch from a PowerShell window with `$env:HOTMIC_TEAMS_DEBUG = "1"; .\dist\hotmic.exe`. The Teams client will append protocol frames and state transitions to `%LOCALAPPDATA%\HotMic\teams-debug.log` (truncated at 256 KB). Tokens are auto-redacted, so the log is safe to share.
+1. **Are you on new Teams?** The UI Automation fallback targets the current MSIX Teams desktop app. Classic Teams and Teams Personal still use registry-only behavior.
+2. **Is Teams using English UI labels?** The fallback recognizes the English accessible actions `Mute` and `Unmute`. An unknown label fails safe by keeping the red border visible.
+3. **Does your build still show Manage API?** If so, enable it and approve HotMic as described above. The Local API does not depend on UI language.
+4. **Capture a Local API debug log.** Stop HotMic, then re-launch from PowerShell with `$env:HOTMIC_TEAMS_DEBUG = "1"; .\dist\hotmic.exe`. Protocol frames and state transitions are appended to `%LOCALAPPDATA%\HotMic\teams-debug.log` and truncated at 256 KB. Tokens are redacted automatically.
 
 ### What HotMic Does And Does Not Do With Teams
 
-- **Reads** `isInMeeting` and `isMuted` from the `meetingUpdate` event stream over a loopback-only WebSocket at `127.0.0.1:8124`.
-- **Sends** exactly one outgoing request, `{"action":"pair"}`, the very first time, plus pong frames in response to Teams' pings and a single close frame on shutdown.
+- **Reads** `isInMeeting` and `isMuted` from the Local API when Teams exposes it.
+- **Falls back** to reading only the current Teams microphone button's automation ID and accessible action name.
+- **Never clicks or invokes** the Teams button. UI Automation access is read-only.
+- **Sends** only the Local API's one-time `{"action":"pair"}` request, plus protocol-required pong and close frames.
 - **Never sends** `toggle-mute`, `leave-call`, `toggle-video`, or any other write action. Although the token Teams hands us grants WRITE access, `src/teams.rs` exposes no public method that produces any of those payloads. See [Security Posture](#security-posture) for the full constraint list.
 
 ## Troubleshooting
 
 **Border doesn't appear when I open the camera.** Check that the app in question goes through `CapabilityAccessManager`: open `regedit` and look under `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam` while the camera is active. If your app isn't listed there, it's using one of the legacy paths HotMic doesn't watch. Some older capture tools and a few games fall into this bucket.
 
-**Red mic border stays on after I muted in Microsoft Teams.** See the [Microsoft Teams Setup](#microsoft-teams-setup) section above. Other VoIP apps (Zoom, Discord, Slack huddles, Meet-in-browser) don't expose an equivalent local API, so the border still false-positives on mute for those.
+**Red mic border stays on after I muted in Microsoft Teams.** See the [Microsoft Teams Setup](#microsoft-teams-setup) section above. Other VoIP apps (Zoom, Discord, Slack huddles, Meet-in-browser) do not expose an equivalent state signal, so the border still false-positives on mute for those.
 
 **Border appears in the wrong place / corners don't match my screen.** The corner radius is hardcoded to 12 logical pixels. If your laptop's display has a tighter or wider curve, edit `CORNER_RADIUS_LOGICAL` in `src/lib.rs` and rebuild.
 
@@ -144,16 +141,16 @@ Each app gets a subkey with a `LastUsedTimeStop` value. While the app holds the 
 
 The registry trick above has one well-known false positive: Microsoft Teams keeps the WASAPI capture stream open even when you mute yourself in a call (it discards the captured samples in user space so unmute is zero-latency). The OS therefore reports the mic as still "in use" while you're muted, and HotMic's red border would otherwise stay on for the entire call.
 
-To fix this without losing detection accuracy, HotMic also speaks to the **Teams Local API** at `ws://127.0.0.1:8124`. New Teams (the MSIX build) exposes a per-user, opt-in WebSocket that pushes a `meetingUpdate` event every time `isInMeeting` or `isMuted` changes. HotMic reads only those two booleans. The detection rule becomes:
+HotMic prefers the Teams Local API at `ws://127.0.0.1:8124` when available. Some current Teams builds no longer expose that service, so `src/teams_ui.rs` falls back to Windows UI Automation and reads the meeting microphone button's accessible action. `Unmute` means the mic is currently muted; `Mute` means it is live. The detection rule is:
 
 ```
 mic_border_on = non_teams_app_holds_mic
              || (teams_holds_mic && !teams_says_we_are_muted_in_a_call)
 ```
 
-If Teams isn't running, the API is disabled, you have classic Teams, or you decline the Allow toast, the WebSocket simply isn't connected and the rule degrades to the original behavior (border on whenever Teams holds the mic). Per-app fusion means a non-Teams app holding the mic always keeps the border on, even if Teams is muted in parallel.
+The Local API wins after it supplies a complete meeting state. Otherwise HotMic uses UI Automation. If neither source is readable, the rule fails safe to the original registry-only behavior and keeps the border on. Per-app fusion means a non-Teams app holding the mic always keeps the border on, even if Teams is muted in parallel.
 
-**First-run pairing.** On first launch, the WebSocket connects and Teams sends a `meetingPermissions` block. When Teams sets `canPair:true` (which only happens once you're in a meeting), HotMic sends a single `{"action":"pair"}` request. That's what triggers the Allow banner inside Teams. Click Allow and Teams returns a one-time token that HotMic stores DPAPI-wrapped at `%LOCALAPPDATA%\HotMic\teams.token`; subsequent connections present the token and skip the pairing step. If the token is ever rejected (you removed HotMic from Teams' allowed apps, signed in as a different account, reinstalled Teams, etc.), Teams will resume sending `canPair:true` and HotMic will automatically discard the stale token and pair again, with no manual cleanup required. To force a fresh pair anyway, delete the token file and restart HotMic while in a meeting.
+**Local API pairing.** On older builds that expose the service, Teams sends a `meetingPermissions` block. When it sets `canPair:true`, HotMic sends one `{"action":"pair"}` request to trigger the Allow banner. Teams returns a token that HotMic stores DPAPI-wrapped at `%LOCALAPPDATA%\HotMic\teams.token`. Current builds without the service skip this path and use UI Automation without setup.
 
 ## How It Draws the Border
 
@@ -202,13 +199,13 @@ Each `.ico` packs seven native resolutions so Windows can pick the best size for
 
 ## Tests
 
-Pure logic (color matrix, DPI scaling, registry value parsing, wide-string helpers, Teams identity matching, mute-fusion truth table, JSON scanner for `meetingUpdate`, base64, and the RFC 6455 framer/parser) lives in `src/lib.rs` and runs natively on the build container's host target (Linux ARM/x64). The Win32 surface (windowing, registry I/O, tray, sockets, DPAPI) can't be unit-tested without running on Windows; that's covered by your manual smoke test.
+Pure logic (color matrix, DPI scaling, registry value parsing, wide-string helpers, Teams identity matching, mute-fusion truth table, Teams accessibility-label parsing, JSON scanner for `meetingUpdate`, base64, and the RFC 6455 framer/parser) lives in `src/lib.rs` and runs natively on the build container's host target (Linux ARM/x64). The Win32 surface (windowing, registry I/O, UI Automation, tray, sockets, DPAPI) cannot be unit-tested without running on Windows; that is covered by the manual smoke test.
 
 ```powershell
 docker run --rm -v "${PWD}:/work" -w /work hotmic-builder cargo test --lib
 ```
 
-83 tests as of this writing. Format, clippy, tests, and build all run cleanly:
+112 tests as of this writing. Format, clippy, tests, and build all run cleanly:
 
 ```powershell
 docker run --rm -v "${PWD}:/work" -w /work hotmic-builder bash -c "
@@ -238,6 +235,7 @@ hotmic/
 │   ├── overlay.rs          # full-screen layered window + GDI border drawing
 │   ├── detect.rs           # registry walk + RegNotifyChangeKeyValue watcher
 │   ├── teams.rs            # Teams Local API WebSocket client (pair + read)
+│   ├── teams_ui.rs         # read-only Teams UI Automation mute fallback
 │   └── autostart.rs        # HKCU Run-key read/write/delete
 ├── assets/
 │   ├── logo.svg            # README logo
@@ -256,14 +254,14 @@ hotmic/
 ```
    ┌──────────────────────────────────────┐    ┌──────────────────────────────────┐
    │   Windows CapabilityAccessManager    │    │   Microsoft Teams (new Teams)    │
-   │   HKCU + HKLM   webcam | microphone  │    │   Local API ws://127.0.0.1:8124  │
+   │   HKCU + HKLM   webcam | microphone  │    │   Local API or UI Automation     │
    └──────────────────┬───────────────────┘    └──────────────┬───────────────────┘
-                      │ change events                         │ meetingUpdate frames
+                      │ change events                         │ mute state
                       ▼                                       ▼
    ┌────────────────────────────────────┐   ┌────────────────────────────────────┐
-   │ Watcher (src/detect.rs)            │   │ Teams client (src/teams.rs)        │
+   │ Watcher (src/detect.rs)            │   │ Teams mute detector                │
    │ 4× RegNotifyChangeKeyValue         │   │ WebSocket + DPAPI-wrapped token,   │
-   │ + 500 ms backstop poll             │   │ posts WM_TEAMS_STATE_CHANGED       │
+   │ + 500 ms backstop poll             │   │ or read-only UI Automation         │
    └─────────────────┬──────────────────┘   └──────────────────┬─────────────────┘
                      │                                         │
                      └──────────────────┬──────────────────────┘
@@ -292,7 +290,7 @@ hotmic/
        └──────────────────┘                            └──────────────────┘
 ```
 
-One process, one thread. The registry tells us when a device opens or closes; the Teams Local API tells us whether the user is muted inside a Teams call; the message loop fuses both signals into a colored border on the screen and a state-matching icon in the tray.
+One process, one thread. The registry tells us when a device opens or closes; the Teams Local API or UI Automation tells us whether the user is muted inside a Teams call; the message loop fuses both signals into a colored border on the screen and a state-matching icon in the tray.
 
 ### Event-Driven, Not Polling
 
@@ -300,11 +298,13 @@ The watcher (`src/detect.rs`) opens four registry keys (HKCU + HKLM × webcam + 
 
 A 500 ms backstop `WM_TIMER` covers the rare case where `CapabilityAccessManager` writes don't trigger a `RegNotifyChangeKeyValue` callback (sometimes the kernel coalesces deeply-nested changes). A 150 ms off-debounce prevents the border from flickering during the brief stop/start that some apps do while negotiating device formats.
 
-### Teams Local API Client
+### Teams Mute Detection
 
-The Teams client (`src/teams.rs`) runs on the same thread as the watcher. It opens a single non-blocking TCP socket to `127.0.0.1:8124` and uses `WSAAsyncSelect` so the socket's `FD_READ`/`FD_WRITE`/`FD_CLOSE` notifications post `WM_TEAMS_SOCKET` messages back to the message loop. The WebSocket upgrade, pairing handshake, frame parsing, ping/pong, and reconnect/backoff all run inside the same `MsgWaitForMultipleObjectsEx` pump as the registry watcher. Every received text frame that updates `isInMeeting` or `isMuted` posts a `WM_TEAMS_STATE_CHANGED`, which re-runs `apply_state` immediately rather than waiting for the next 500 ms backstop tick.
+The Teams client (`src/teams.rs`) runs on the same thread as the watcher. When port 8124 is available, it opens one non-blocking loopback socket and uses `WSAAsyncSelect` so `FD_READ`, `FD_WRITE`, and `FD_CLOSE` notifications post `WM_TEAMS_SOCKET` messages to the main loop. A complete Local API meeting state is authoritative and triggers `WM_TEAMS_STATE_CHANGED` immediately.
 
-The first time you run HotMic with Teams open, the client sends a single `{"action":"pair"}` request to trigger Teams' Allow banner. After you click **Allow**, Teams replies with a permanent token; HotMic encrypts it with `CryptProtectData(CRYPTPROTECT_UI_FORBIDDEN)` and stores it at `%LOCALAPPDATA%\HotMic\teams.token`. Subsequent runs reuse the wrapped token with no UI. If Teams ever returns "token invalid" (after a Teams reinstall or a manual sign-out), the client deletes the stored token and re-pairs from scratch.
+When the Local API is absent or has not supplied a complete state, and the registry says Teams holds the mic, `src/teams_ui.rs` enumerates top-level `TeamsWebView` windows and finds the `microphone-button` element through Windows UI Automation. It reads the accessible action name only. Conflicting duplicate windows fail safe to mic-live, unknown labels keep the border on, and the 500 ms backstop scan picks up changes without another thread.
+
+Older Local API builds still use the one-time `{"action":"pair"}` request. The returned token is encrypted with `CryptProtectData(CRYPTPROTECT_UI_FORBIDDEN)` and stored at `%LOCALAPPDATA%\HotMic\teams.token`.
 
 ### Single Instance
 
@@ -330,7 +330,8 @@ Change either, rebuild via `.\build.ps1`, relaunch.
 ## Security Posture
 
 - **No elevation.** `asInvoker` in the manifest. Runs entirely as the current user.
-- **Loopback networking only.** One TCP connection to `127.0.0.1:8124` for the Teams Local API (see "Microsoft Teams in-app mute" above). The socket is opened only after the Watcher starts and is closed on exit. No outbound traffic ever leaves `127.0.0.1`.
+- **Loopback networking only.** When Teams exposes its Local API, HotMic opens one TCP connection to `127.0.0.1:8124`. No traffic leaves the machine.
+- **Read-only Teams UI Automation.** The fallback reads the automation ID and accessible action name of the Teams microphone button. It never invokes, clicks, focuses, or changes a Teams control.
 - **DPAPI-wrapped Teams token.** When Teams pairs with us, it sends a one-time token granting access to its local API. We store it at `%LOCALAPPDATA%\HotMic\teams.token`, encrypted with `CryptProtectData(CRYPTPROTECT_UI_FORBIDDEN)` so only the same Windows user on the same machine can decrypt it. `%LOCALAPPDATA%` already has user-only ACLs by default.
 - **Minimal Teams client surface.** Although the token Teams gives us also grants WRITE access (toggle mute, leave call, toggle video, etc.), `src/teams.rs` exposes no public method that sends any action other than a single one-time `{"action":"pair"}` request used to trigger Teams' Allow banner during initial pairing. After that, the only outgoing payloads are pong frames in response to pings and a single close frame on shutdown. We never send `toggle-mute`, `leave-call`, `toggle-video`, or any other write action.
 - **HKCU/HKLM read-only for detection.** Only opens the two registry trees with `KEY_READ | KEY_NOTIFY`. The only registry writes are to the optional autostart Run-key, which is HKCU and per-user.
@@ -343,9 +344,9 @@ It's a passive indicator. It can't itself prevent the camera or mic from being o
 
 - **Primary monitor only.** Multi-monitor support would mean tracking each monitor's bounds and DPI separately and managing multiple overlay windows. Out of scope for the current design.
 - **Legacy DirectShow / older WASAPI apps not detected.** See "How it detects things" above.
-- **Mic-mute false positive on non-Teams VoIP.** Zoom, Discord, Slack huddles, Meet-in-browser, and other apps that keep their capture stream open while muted will still show the red border. The Teams Local API fixes this for new Teams only; no equivalent local API exists for the others.
-- **Classic Teams and Teams Personal don't expose the API.** The mic-mute fix only kicks in for new Teams (the `MSTeams_8wekyb3d8bbwe` MSIX). Classic Teams (`Teams.exe` Squirrel install) and Teams Personal degrade to the original behavior.
-- **IT-disabled API.** A managed device can disable the third-party API via Teams admin policy; the toggle under **Settings > Privacy** is greyed out in that case. HotMic falls back to registry-only behavior automatically.
+- **Mic-mute false positive on non-Teams VoIP.** Zoom, Discord, Slack huddles, Meet-in-browser, and other apps that keep their capture stream open while muted still show the red border. They do not expose an equivalent state signal.
+- **Classic Teams and Teams Personal are not covered by the UI fallback.** The mic-mute fix targets new Teams (`MSTeams_8wekyb3d8bbwe`). Other clients degrade to registry-only behavior.
+- **The UI fallback currently recognizes English Teams labels.** If the accessible microphone action is not `Mute` or `Unmute`, HotMic fails safe and keeps the red border visible. A future Teams UI change could also require updating the stable window class or automation ID.
 - **Full-screen exclusive apps cover the border.** Acceptable: those apps aren't really compatible with any topmost indicator.
 - **Move or rename the repo: autostart breaks.** The Run-key records the absolute path to `dist\hotmic.exe`. Re-toggle the menu item to fix.
 

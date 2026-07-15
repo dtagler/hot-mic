@@ -4,6 +4,7 @@ mod autostart;
 mod detect;
 mod overlay;
 mod teams;
+mod teams_ui;
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -52,10 +53,10 @@ struct App {
     last_state: DeviceState,
     pending_off: bool,
     debounce_due: Option<Instant>,
-    /// Latest known Teams in-app mute state, fed by the Teams Local API
-    /// WebSocket client. Defaults to `false` whenever the WS isn't connected
-    /// (first run, classic Teams, IT-disabled API, connection drop) so the
-    /// detection rule degrades cleanly to the original registry-only behavior.
+    /// Latest known Teams in-app mute state. The Local API is preferred when
+    /// available; read-only UI Automation covers current Teams builds that no
+    /// longer expose it. Defaults to `false` when neither source is readable so
+    /// the detection rule fails safe to the original registry-only behavior.
     teams_muted_now: bool,
     /// Last visible (cam, mic) the overlay was asked to paint. Used to make
     /// the debounce decision based on what the user actually saw, not on the
@@ -296,7 +297,7 @@ fn apply_state(app: &mut App, new_state: DeviceState, bypass_debounce: bool) {
 }
 
 fn apply_scanned_state(app: &mut App, new_state: DeviceState) {
-    app.teams_muted_now = app.teams.muted_now();
+    app.teams_muted_now = app.teams.muted_now(new_state.mic_teams);
 
     if app.pending_off {
         let (cam_visible, mic_visible) = visible_devices(
@@ -426,7 +427,7 @@ extern "system" fn msg_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                                 app.pending_off = false;
                                 app.debounce_due = None;
                                 let s = app.watcher.scan();
-                                app.teams_muted_now = app.teams.muted_now();
+                                app.teams_muted_now = app.teams.muted_now(s.mic_teams);
                                 // bypass_debounce=true: the timer firing IS the
                                 // commit of the deferred off-transition. Without
                                 // this, apply_state would see was_active=true (from
@@ -551,7 +552,7 @@ fn handle_menu(hwnd: HWND, id: u32) {
                 if let Some(app) = cell.borrow_mut().as_mut() {
                     app.enabled = !app.enabled;
                     let s = app.watcher.scan();
-                    app.teams_muted_now = app.teams.muted_now();
+                    app.teams_muted_now = app.teams.muted_now(s.mic_teams);
                     apply_state(app, s, false);
                 }
             });
