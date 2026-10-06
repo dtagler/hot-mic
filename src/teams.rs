@@ -1,33 +1,34 @@
-//! Microsoft Teams mute-state client.
+//! Microsoft Teams meeting-state client.
 //!
-//! Connects to the (local-only) Teams Local API at `ws://127.0.0.1:8124` and
-//! reads `meetingUpdate` push messages so we know whether the user has muted
-//! themselves *inside* Microsoft Teams. The OS doesn't expose this — Teams
-//! drops captured samples in user space without ever calling the WASAPI mute
-//! API. Teams builds that no longer expose the Local API fall back to the
-//! read-only UI Automation detector in `teams_ui`.
+//! The optional Local API at `ws://127.0.0.1:8124` supplies meeting/mute updates.
+//! The read-only detector in `teams_ui` is sampled independently of both that
+//! connection and consent-store activity, including while the API is usable.
+//! Its confirmed meeting controls recover camera and microphone activity when
+//! registry timestamps are stale. Registry capture alone cannot establish
+//! Teams' in-app mute state.
 //!
 //! ## Single-thread integration
 //! `WSAAsyncSelect` posts socket events as `WM_TEAMS_SOCKET` window messages
-//! that arrive on the existing message-loop thread. No tokio, no extra
-//! threads, no channels.
+//! that arrive on the existing application message-loop thread. HotMic creates
+//! no polling worker thread or channel; Windows/COM may manage internal threads.
 //!
 //! ## Minimal client surface
-//! This client deliberately sends exactly one type of action: a single
-//! `{"action":"pair"}` request, sent once per connection only when Teams
-//! advertises `canPair:true` and we have no stored token. That's what
-//! triggers the Allow banner inside Teams during first-run pairing. We never
-//! send `toggle-mute`, `leave-call`, `toggle-video`, or any other action.
+//! The only application action sent is `{"action":"pair"}`, at most once per
+//! connection when Teams advertises `canPair:true`. A stored token is discarded
+//! on that signal so revoked authorization can be paired again. The client
+//! never sends `toggle-mute`, `leave-call`, `toggle-video`, or other call actions.
 //! Other outgoing payloads are the HTTP upgrade request, pong frames in
 //! response to server pings, and a single close frame on shutdown. The token
 //! Teams gives us grants WRITE access to those actions; this discipline plus
 //! DPAPI wrapping is the mitigation for token misuse.
 //!
 //! ## Degradation
-//! The Local API is preferred after it supplies a complete meeting state.
-//! Otherwise `muted_now()` asks the UI Automation fallback while Teams holds
-//! the mic. If neither source is readable, it returns `false`, keeping the
-//! border on rather than hiding a real capture indicator.
+//! A complete Local API state wins for meeting membership and mute while the
+//! connection remains open. Camera fallback still comes from the UI snapshot.
+//! A periodic UI Automation snapshot supplies camera and microphone activity
+//! even when consent-store timestamps are stale. Confirmed meeting controls
+//! distinguish a call from a preview. Unknown mute state never suppresses
+//! registry-detected activity, and another app's capture remains independent.
 
 use std::env;
 use std::ffi::c_void;
@@ -43,11 +44,12 @@ use windows::Win32::Security::Cryptography::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use hotmic::{
-    base64_encode, parse_can_pair, parse_meeting_update, redact_secrets, resolve_teams_muted,
-    ws_build_close_frame, ws_build_text_frame, ws_handshake_request, ws_parse_frame, WsFrameParse,
+    base64_encode, parse_can_pair, parse_meeting_update, redact_secrets, resolve_teams_activity,
+    ws_build_close_frame, ws_build_text_frame, ws_handshake_request, ws_parse_frame, TeamsActivity,
+    TeamsUiState, WsFrameParse,
 };
 
-use crate::teams_ui::MuteDetector;
+use crate::teams_ui::MeetingDetector;
 
 /// Posted to `msg_hwnd` by `WSAAsyncSelect` whenever something happens on the
 /// Teams socket. lParam encodes the FD_* event in the low word and the
@@ -90,8 +92,8 @@ pub struct Client {
     is_muted: bool,
     /// Last `meetingState.isInMeeting` we observed from a `meetingUpdate`.
     in_meeting: bool,
-    /// True after the Local API has supplied a complete meeting state on this
-    /// connection. Until then, UI Automation remains the fallback source.
+    /// True after the API supplies a complete meeting/mute state on this
+    /// connection. UI sampling continues independently for camera activity.
     meeting_state_seen: bool,
     backoff_ms: u32,
     /// True between scheduling a reconnect and the timer firing. Prevents
@@ -113,8 +115,10 @@ pub struct Client {
     /// in `close_socket`. Prevents spamming `pair` requests every time Teams
     /// re-broadcasts `meetingPermissions` with `canPair:true`.
     pair_sent: bool,
-    /// Read-only fallback for Teams builds that no longer expose the Local API.
-    ui_mute: Option<MuteDetector>,
+    /// Independent read-only meeting-control detector, with or without the API.
+    ui_detector: Option<MeetingDetector>,
+    /// Replaced by each UI poll, including an empty result after a meeting ends.
+    ui_state: TeamsUiState,
 }
 
 impl Client {
@@ -135,19 +139,27 @@ impl Client {
             fragment_buf: Vec::new(),
             fragment_opcode: None,
             pair_sent: false,
-            ui_mute: MuteDetector::new().ok(),
+            ui_detector: MeetingDetector::new().ok(),
+            ui_state: TeamsUiState::default(),
         }
     }
 
-    /// Resolve the current Teams mute state. A complete Local API state wins;
-    /// otherwise the read-only UI Automation detector supplies the fallback
-    /// while Teams holds the mic. Unknown fails safe to `false`.
-    pub fn muted_now(&self, teams_active: bool) -> bool {
-        let local_api_muted = (self.state == State::Open && self.meeting_state_seen)
-            .then_some(self.in_meeting && self.is_muted);
-        resolve_teams_muted(local_api_muted, teams_active, || {
-            self.ui_mute.as_ref().and_then(MuteDetector::muted_now)
-        })
+    /// Read-only UI polling is independent of registry activity. Called at
+    /// startup, on the backstop timer, debounce commit, and Enabled toggle;
+    /// registry and socket events reuse the snapshot instead of querying again.
+    pub fn refresh_ui_state(&mut self) {
+        self.ui_state = self
+            .ui_detector
+            .as_ref()
+            .map(MeetingDetector::scan)
+            .unwrap_or_default();
+    }
+
+    /// Resolve the latest snapshot without another cross-process UI query.
+    pub fn activity_now(&self) -> TeamsActivity {
+        let local_api_state = (self.state == State::Open && self.meeting_state_seen)
+            .then_some((self.in_meeting, self.is_muted));
+        resolve_teams_activity(local_api_state, self.ui_state)
     }
 
     /// Kick off the first connect attempt. Safe to call exactly once at
@@ -156,7 +168,7 @@ impl Client {
         log_debug(&format!(
             "start: token_present={} ui_fallback_available={}",
             self.token.is_some(),
-            self.ui_mute.is_some()
+            self.ui_detector.is_some()
         ));
         self.ensure_wsa_started();
         self.try_connect();

@@ -22,8 +22,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use detect::{DeviceState, Watcher};
 use hotmic::{
     should_cancel_pending_off, should_commit_pending_off_timer, should_defer_off_transition,
-    should_start_debounce, should_update_tray_icon, tray_appearance, visible_devices, ICON_BOTH,
-    ICON_CAM, ICON_IDLE, ICON_MIC,
+    should_start_debounce, should_update_tray_icon, tray_appearance, visible_devices_with_teams,
+    TeamsActivity, ICON_BOTH, ICON_CAM, ICON_IDLE, ICON_MIC,
 };
 use overlay::Overlay;
 use teams::{Client as TeamsClient, RECONNECT_TIMER, WM_TEAMS_SOCKET, WM_TEAMS_STATE_CHANGED};
@@ -53,14 +53,13 @@ struct App {
     last_state: DeviceState,
     pending_off: bool,
     debounce_due: Option<Instant>,
-    /// Latest known Teams in-app mute state. The Local API is preferred when
-    /// available; read-only UI Automation covers current Teams builds that no
-    /// longer expose it. Defaults to `false` when neither source is readable so
-    /// the detection rule fails safe to the original registry-only behavior.
-    teams_muted_now: bool,
+    /// Latest Teams activity. UI Automation can recover camera and microphone
+    /// use when the registry is stale; complete Local API state wins for
+    /// meeting membership and mute, while camera fallback remains UI-derived.
+    teams_activity: TeamsActivity,
     /// Last visible (cam, mic) the overlay was asked to paint. Used to make
     /// the debounce decision based on what the user actually saw, not on the
-    /// raw registry state — a flip in `teams_muted_now` alone (registry
+    /// raw registry state — a flip in `teams_activity` alone (registry
     /// unchanged) must still arm the off-debounce, otherwise a quick
     /// mute/unmute toggle would visibly flicker the border off.
     last_visible: (bool, bool),
@@ -112,7 +111,7 @@ fn main() -> Result<()> {
         last_state: DeviceState::default(),
         pending_off: false,
         debounce_due: None,
-        teams_muted_now: false,
+        teams_activity: TeamsActivity::default(),
         last_visible: (false, false),
         last_tray_icon: ICON_IDLE,
         last_tray_tip: "HotMic",
@@ -139,6 +138,7 @@ fn main() -> Result<()> {
             // to msg_hwnd as the connection progresses; degrades silently if
             // Teams isn't running or the API is disabled.
             app.teams.start();
+            app.teams.refresh_ui_state();
             let s = app.watcher.scan();
             apply_scanned_state(app, s);
         }
@@ -206,11 +206,11 @@ fn run_message_loop(_msg_hwnd: HWND) {
 }
 
 fn apply_state(app: &mut App, new_state: DeviceState, bypass_debounce: bool) {
-    let (cam_visible, mic_visible) = visible_devices(
+    let (cam_visible, mic_visible) = visible_devices_with_teams(
         new_state.cam,
         new_state.mic_non_teams,
         new_state.mic_teams,
-        app.teams_muted_now,
+        app.teams_activity,
     );
 
     if !app.enabled {
@@ -234,7 +234,7 @@ fn apply_state(app: &mut App, new_state: DeviceState, bypass_debounce: bool) {
     }
 
     // Debounce against what was actually painted, not against the raw registry
-    // state. A flip in `teams_muted_now` alone (registry unchanged) still
+    // state. A flip in `teams_activity` alone (registry unchanged) still
     // counts as an active→idle transition and must be debounced, otherwise a
     // quick mute/unmute toggle would visibly flicker the border off.
     //
@@ -297,14 +297,14 @@ fn apply_state(app: &mut App, new_state: DeviceState, bypass_debounce: bool) {
 }
 
 fn apply_scanned_state(app: &mut App, new_state: DeviceState) {
-    app.teams_muted_now = app.teams.muted_now(new_state.mic_teams);
+    app.teams_activity = app.teams.activity_now();
 
     if app.pending_off {
-        let (cam_visible, mic_visible) = visible_devices(
+        let (cam_visible, mic_visible) = visible_devices_with_teams(
             new_state.cam,
             new_state.mic_non_teams,
             new_state.mic_teams,
-            app.teams_muted_now,
+            app.teams_activity,
         );
         if should_cancel_pending_off(cam_visible, mic_visible) {
             unsafe {
@@ -321,11 +321,11 @@ fn apply_scanned_state(app: &mut App, new_state: DeviceState) {
 }
 
 fn current_tray_appearance(app: &App) -> (u16, &'static str) {
-    let (cam_visible, mic_visible) = visible_devices(
+    let (cam_visible, mic_visible) = visible_devices_with_teams(
         app.last_state.cam,
         app.last_state.mic_non_teams,
         app.last_state.mic_teams,
-        app.teams_muted_now,
+        app.teams_activity,
     );
     tray_appearance(app.enabled, cam_visible, mic_visible)
 }
@@ -410,6 +410,10 @@ extern "system" fn msg_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 if id == BACKSTOP_TIMER {
                     APP.with(|cell| {
                         if let Some(app) = cell.borrow_mut().as_mut() {
+                            // Poll Teams even when consent-store records say
+                            // idle, but do not repeat UI searches for every
+                            // registry notification or socket message.
+                            app.teams.refresh_ui_state();
                             let s = app.watcher.scan();
                             apply_scanned_state(app, s);
                         }
@@ -426,8 +430,9 @@ extern "system" fn msg_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                                 let _ = KillTimer(Some(hwnd), DEBOUNCE_TIMER);
                                 app.pending_off = false;
                                 app.debounce_due = None;
+                                app.teams.refresh_ui_state();
                                 let s = app.watcher.scan();
-                                app.teams_muted_now = app.teams.muted_now(s.mic_teams);
+                                app.teams_activity = app.teams.activity_now();
                                 // bypass_debounce=true: the timer firing IS the
                                 // commit of the deferred off-transition. Without
                                 // this, apply_state would see was_active=true (from
@@ -551,8 +556,9 @@ fn handle_menu(hwnd: HWND, id: u32) {
             APP.with(|cell| {
                 if let Some(app) = cell.borrow_mut().as_mut() {
                     app.enabled = !app.enabled;
+                    app.teams.refresh_ui_state();
                     let s = app.watcher.scan();
-                    app.teams_muted_now = app.teams.muted_now(s.mic_teams);
+                    app.teams_activity = app.teams.activity_now();
                     apply_state(app, s, false);
                 }
             });

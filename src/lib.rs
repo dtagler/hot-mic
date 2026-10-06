@@ -1,6 +1,14 @@
 //! Pure, platform-independent helpers used by the hotmic binary.
 //! Kept free of Win32 imports so tests can run on any host.
 
+mod teams_activity;
+
+pub use teams_activity::{
+    combine_teams_window_states, parse_teams_camera_button_name, resolve_teams_activity,
+    teams_window_state, teams_window_state_from_controls, visible_devices_with_teams,
+    TeamsActivity, TeamsControl, TeamsUiState,
+};
+
 pub const COLOR_BLUE: u32 = 0x00FF8000;
 pub const COLOR_RED: u32 = 0x000000DC;
 pub const COLOR_PURPLE: u32 = 0x00EA3393;
@@ -138,8 +146,9 @@ pub fn overlay_visibility_plan(
     }
 }
 
-/// Parses LastUsedTimeStop bytes. `0` means the device is in use right now.
-/// Other values (real FILETIMEs) mean it was released. Wrong size = treat as not in use.
+/// Interprets an eight-byte LastUsedTimeStop value of zero as reported activity.
+/// Other values and malformed sizes are inactive registry observations.
+/// Stale records can therefore miss actual activity; Teams has a separate path.
 pub fn parse_in_use(bytes: &[u8], size: usize) -> bool {
     if size != 8 || bytes.len() < 8 {
         return false;
@@ -212,8 +221,9 @@ pub fn combine_teams_mic_button_states(states: &[Option<bool>]) -> Option<bool> 
     }
 }
 
-/// Prefer an authoritative Local API state. Query UI Automation only while
-/// Teams holds the mic and the API is unavailable, then fail safe to mic-live.
+/// Prefer an authoritative Local API mute state. Otherwise use the supplied UI
+/// observation for an active Teams session, then fail safe to mic-live.
+/// Activity can come from meeting controls independently of the registry.
 pub fn resolve_teams_muted<F>(
     local_api_muted: Option<bool>,
     teams_active: bool,
@@ -229,15 +239,16 @@ where
     }
 }
 
-/// Final mic-show decision after fusing registry attribution with the resolved
-/// Teams mute state. The OR keeps the border on whenever any non-Teams app
-/// holds the mic; Teams' branch is suppressed only when Teams is known muted.
+/// Mic-show decision for attributed activity and resolved Teams mute state.
+/// Teams activity can come from the registry or a confirmed meeting. A
+/// non-Teams activity signal always wins over Teams mute suppression.
 pub fn mic_should_show(non_teams_active: bool, teams_active: bool, teams_muted_now: bool) -> bool {
     non_teams_active || (teams_active && !teams_muted_now)
 }
 
-/// Final visible device tuple after fusing raw registry state with Teams mute.
-/// Keeps camera visibility independent of any Teams mic suppression.
+/// Base visibility rule for activity inputs and resolved Teams mute.
+/// The app uses `visible_devices_with_teams` to add independent meeting activity
+/// before this rule is evaluated. Teams mute never suppresses camera activity.
 pub fn visible_devices(
     cam_active: bool,
     mic_non_teams_active: bool,

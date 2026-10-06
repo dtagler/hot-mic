@@ -1,3 +1,7 @@
+//! Raw consent-store observations, not authoritative hardware activity.
+//! A stale stopped record or unreadable value looks inactive here. Independent Teams
+//! meeting activity is merged later by `visible_devices_with_teams`.
+
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Registry::*;
@@ -12,13 +16,13 @@ const MIC_PATH: &str =
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct DeviceState {
+    /// At least one monitored registry entry reports camera activity.
     pub cam: bool,
-    /// True when at least one non-Teams app subkey holds the microphone.
+    /// At least one non-Teams app entry reports microphone activity.
     pub mic_non_teams: bool,
     /// True when at least one Teams subkey (`MSTeams_8wekyb3d8bbwe` or
-    /// classic Squirrel path) holds the microphone, regardless of whether
-    /// the user has muted in-app. The Teams detector supplies the mute state
-    /// separately.
+    /// classic Squirrel path) reports microphone activity. This neither
+    /// establishes in-app mute state nor gates independent meeting detection.
     pub mic_teams: bool,
 }
 
