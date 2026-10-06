@@ -31,8 +31,6 @@
 
 **Blue** for camera, **red** for mic, **purple** for both. The click-through border has rounded corners and fades in and out. Color changes and tray-icon updates do not wait for a fade.
 
-The [unreleased fix and validation record](CHANGELOG.md#unreleased) describe the stale-registry Teams issue and the checks completed for it.
-
 ## Why
 
 Modern apps light up the webcam or pick up audio from the mic without making it obvious. Windows 11 shows a tiny privacy indicator in the system tray, but it's easy to miss. HotMic gives you a peripheral-vision signal you can't ignore.
@@ -149,7 +147,7 @@ This log covers the WebSocket client, not UI Automation control snapshots, so it
 
 **No border for any app.** Check that HotMic is running, **Enabled** is checked, and you are looking at the primary monitor. Exit and relaunch HotMic after replacing its executable; starting another copy alone has no effect.
 
-**No border during a Teams meeting even though camera and mic are on.** Confirm you are running the rebuilt executable containing the [stale-registry fix](CHANGELOG.md#unreleased), not an older release binary. Join the meeting rather than staying in its preview. The fallback needs the desktop window and control IDs above, readable controls, and recognized camera-action labels. Old `LastUsedTimeStop` values no longer block this independent Teams path.
+**No border during a Teams meeting even though camera and mic are on.** Use v0.2.4 or later, which includes independent Teams activity detection. Exit and relaunch HotMic after replacing an older executable. Join the meeting rather than staying in its preview. The fallback needs the desktop window and control IDs above, readable controls, and recognized camera-action labels. Old `LastUsedTimeStop` values no longer block this independent Teams path.
 
 **No border for a non-Teams camera or microphone.** The registry detector requires readable consent-store entries in HKCU or HKLM. Missing entries, read failures, and stale stopped records produce inactive observations. A stale zero-valued record instead remains active. A missing entry alone does not identify which Windows capture API the app uses. HotMic has no independent activity fallback for other apps.
 
@@ -296,7 +294,7 @@ With no other app holding either device and no additional active registry signal
 7. In a pre-join preview, verify that the UI fallback does not establish a joined meeting. A registry-reported capture can still show a border.
 8. Run a separate microphone-using app while Teams is muted. If Windows reports that other capture, the red component must remain visible.
 
-The user confirmed the red, blue, and purple states in a live Teams call on October 5, 2026. The other manual scenarios above remain a regression checklist, not claims of completed live testing. See [CHANGELOG.md](CHANGELOG.md#validation-on-october-5-2026) for the recorded automated and live checks.
+The user confirmed the red, blue, and purple states in a live Teams call on October 5, 2026. The other manual scenarios above remain a regression checklist, not claims of completed live testing.
 
 ## Project Layout
 
@@ -304,7 +302,6 @@ The user confirmed the red, blue, and purple states in a live Teams call on Octo
 hotmic/
 ├── Cargo.toml              # windows = 0.62, embed-resource = 3
 ├── Cargo.lock
-├── CHANGELOG.md            # unreleased fix and validation record
 ├── .cargo/config.toml      # static-link mingw runtime; -static-libgcc
 ├── Dockerfile              # rust:1.95-bookworm + mingw + clippy + rustfmt
 ├── build.ps1               # one-shot Docker build + copy to dist/
@@ -419,7 +416,7 @@ It's a passive indicator. It can't itself prevent the camera or mic from being o
 - **UI mute suppression needs a confirmed meeting.** Without authoritative Local API state, a readable `Unmute` label alone does not suppress registry-reported Teams microphone activity. If no enabled hangup control can be confirmed, that registry microphone signal remains visible.
 - **Stale registry records for other apps remain a limitation.** The independent activity fallback is specific to joined Teams desktop meetings; it does not replace Windows device monitoring globally.
 - **Registry activity remains additive.** A stale positive camera record can keep blue visible after Teams turns its camera off. Stale microphone records can retain red when no applicable Teams mute state suppresses them. This fix recovers missing Teams activity; it does not repair Windows records.
-- **UI Automation is synchronous.** Visible compatible Teams windows are searched even while Teams is idle. Slow or unavailable providers can delay the message loop or remove the independent activity signal. The 500 ms timer is a polling cadence, not a hard latency bound; the changelog records observed standalone idle-probe timings, not an in-call benchmark.
+- **UI Automation is synchronous.** Visible compatible Teams windows are searched even while Teams is idle. Slow or unavailable providers can delay the message loop or remove the independent activity signal. The 500 ms timer is a polling cadence, not a hard latency bound.
 - **Full-screen exclusive apps cover the border.** Acceptable: those apps aren't really compatible with any topmost indicator.
 - **Move or rename the repo: autostart breaks.** The Run-key records the absolute path to `dist\hotmic.exe`. Re-toggle the menu item to fix.
 
