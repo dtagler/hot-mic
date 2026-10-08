@@ -104,7 +104,7 @@ Keep the meeting selected in its own browser window. A background tab that the b
 
 Browser meeting state is independent of the desktop Local API: an idle or muted desktop client cannot hide a live browser call. Browser capture reported by the registry remains additive, however. HotMic cannot attribute that capture to a particular tab, so muting Teams on the web does not suppress an active browser registry record.
 
-Browser detection was added after v0.2.4. Rebuild and restart HotMic to test this source change; a stock v0.2.4 executable has the desktop-only detector. The user has confirmed all three browser border colors; the remaining live checks are listed below.
+Browser detection is included in v0.2.5. A stock v0.2.4 executable has the desktop-only detector. Exit HotMic before replacing an older executable, then launch the new copy. The user has confirmed all three browser border colors; the remaining live checks are listed below.
 
 The UI snapshot is polled by a 500 ms timer. UI Automation call time and message-loop scheduling add latency; this is not a 500 ms response-time guarantee. Transitions to no visible devices also have a 150 ms debounce and a fade lasting about 128 ms under normal timer scheduling.
 
@@ -155,9 +155,9 @@ This log covers the WebSocket client, not UI Automation control snapshots, so it
 
 **No border for any app.** Check that HotMic is running, **Enabled** is checked, and you are looking at the primary monitor. Exit and relaunch HotMic after replacing its executable; starting another copy alone has no effect.
 
-**No border during a Teams meeting even though camera and mic are on.** v0.2.4 introduced independent desktop Teams detection; browser detection requires a build containing the later source change described above. Exit and relaunch HotMic after replacing an older executable. Join the meeting rather than staying in its preview. The fallback needs a compatible desktop window or verified Edge/Chrome document, readable controls, and recognized camera-action labels. For Teams on the web, keep its tab selected in a separate browser window. Old `LastUsedTimeStop` values do not block these independent Teams paths.
+**No border during a Teams meeting even though camera and mic are on.** v0.2.4 introduced independent desktop Teams detection; v0.2.5 adds browser detection. Exit and relaunch HotMic after replacing an older executable. Join the meeting rather than staying in its preview. The fallback needs a compatible desktop window or verified Edge/Chrome document, readable controls, and recognized camera-action labels. For Teams on the web, keep its tab selected in a separate browser window. Old `LastUsedTimeStop` values do not block these independent Teams paths.
 
-**No border for a non-Teams camera or microphone.** Use a build containing the native capture fallback described below, not a stock v0.2.4 binary. Stale stopped registry records cannot establish live activity, but Media Foundation sensor reports and Core Audio capture-session states can supplement them. Missing media components, unavailable providers, or capture paths they do not report can still leave no usable signal. No device is opened to test whether it is busy.
+**No border for a non-Teams camera or microphone.** v0.2.5 adds the native capture fallback described below; a stock v0.2.4 binary does not include it. Stale stopped registry records cannot establish live activity, but Media Foundation sensor reports and Core Audio capture-session states can supplement them. Missing media components, unavailable providers, or capture paths they do not report can still leave no usable signal. No device is opened to test whether it is busy.
 
 **Red mic border stays on after I muted in Microsoft Teams.** See [Microsoft Teams Setup](#microsoft-teams-setup), including duplicate/unknown control readings and other apps using the microphone. HotMic does not integrate with other VoIP apps' mute controls; their capture streams can remain open while muted.
 
