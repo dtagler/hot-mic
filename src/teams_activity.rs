@@ -12,13 +12,23 @@ pub struct TeamsUiState {
     pub camera_on: bool,
 }
 
-/// Resolved Teams observations, not a guarantee of hardware use or transmission.
-/// A complete Local API state wins for meeting/mute; camera remains UI-derived.
+/// Keep the desktop Local API's authority separate from browser meetings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TeamsUiSnapshot {
+    pub desktop: TeamsUiState,
+    pub browser: TeamsUiState,
+}
+
+/// Resolved observations, not a guarantee of hardware use or transmission.
+/// The first three fields describe desktop Teams only. Its Local API must not
+/// override browser activity or let browser mute suppress desktop capture.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TeamsActivity {
     pub in_meeting: bool,
     pub muted: bool,
     pub camera_on: bool,
+    pub browser_camera_on: bool,
+    pub browser_mic_on: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +138,21 @@ pub fn resolve_teams_activity(
             || ui.mic_muted,
         ),
         camera_on: in_meeting && ui.in_meeting && ui.camera_on,
+        ..Default::default()
+    }
+}
+
+/// Resolve desktop precedence before adding independent browser activity.
+/// A browser registry entry cannot be attributed to a particular tab, so
+/// browser mute never suppresses registry-reported microphone capture.
+pub fn resolve_teams_activity_sources(
+    local_api_state: Option<(bool, bool)>,
+    ui: TeamsUiSnapshot,
+) -> TeamsActivity {
+    TeamsActivity {
+        browser_camera_on: ui.browser.in_meeting && ui.browser.camera_on,
+        browser_mic_on: ui.browser.in_meeting && ui.browser.mic_muted != Some(true),
+        ..resolve_teams_activity(local_api_state, ui.desktop)
     }
 }
 
@@ -140,8 +165,8 @@ pub fn visible_devices_with_teams(
     teams: TeamsActivity,
 ) -> (bool, bool) {
     visible_devices(
-        registry_camera || (teams.in_meeting && teams.camera_on),
-        non_teams_mic,
+        registry_camera || (teams.in_meeting && teams.camera_on) || teams.browser_camera_on,
+        non_teams_mic || teams.browser_mic_on,
         teams_mic || teams.in_meeting,
         teams.muted,
     )
@@ -531,6 +556,202 @@ mod tests {
         assert_eq!(
             visible_devices_with_teams(false, false, false, fallback),
             (true, true)
+        );
+    }
+
+    #[test]
+    fn browser_meeting_recovers_both_devices_with_stale_registry() {
+        let teams = resolve_teams_activity_sources(
+            None,
+            TeamsUiSnapshot {
+                browser: live_meeting(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            visible_devices_with_teams(false, false, false, teams),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn browser_meeting_device_states_select_the_expected_border() {
+        for (muted, camera_on, expected) in [
+            (false, true, (true, true)),
+            (true, true, (true, false)),
+            (false, false, (false, true)),
+            (true, false, (false, false)),
+        ] {
+            let teams = resolve_teams_activity_sources(
+                None,
+                TeamsUiSnapshot {
+                    browser: teams_window_state(true, &[Some(muted)], &[Some(camera_on)]),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                visible_devices_with_teams(false, false, false, teams),
+                expected,
+                "muted={muted}, camera_on={camera_on}"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_desktop_api_cannot_hide_a_live_browser_meeting() {
+        for idle_api in [(false, false), (false, true)] {
+            let teams = resolve_teams_activity_sources(
+                Some(idle_api),
+                TeamsUiSnapshot {
+                    browser: live_meeting(),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                visible_devices_with_teams(false, false, false, teams),
+                (true, true)
+            );
+        }
+    }
+
+    #[test]
+    fn muted_desktop_api_cannot_mute_a_live_browser_meeting() {
+        let teams = resolve_teams_activity_sources(
+            Some((true, true)),
+            TeamsUiSnapshot {
+                browser: teams_window_state(true, &[Some(false)], &[Some(false)]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            visible_devices_with_teams(false, false, true, teams),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn desktop_meeting_end_only_discards_desktop_camera_state() {
+        let teams = resolve_teams_activity_sources(
+            Some((false, true)),
+            TeamsUiSnapshot {
+                desktop: live_meeting(),
+                browser: teams_window_state(true, &[Some(false)], &[Some(false)]),
+            },
+        );
+        assert_eq!(
+            visible_devices_with_teams(false, false, false, teams),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn muted_browser_does_not_suppress_desktop_registry_capture() {
+        let teams = resolve_teams_activity_sources(
+            None,
+            TeamsUiSnapshot {
+                browser: teams_window_state(true, &[Some(true)], &[Some(false)]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            visible_devices_with_teams(false, false, true, teams),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn browser_mute_does_not_override_a_live_desktop_call() {
+        let teams = resolve_teams_activity_sources(
+            Some((true, false)),
+            TeamsUiSnapshot {
+                browser: teams_window_state(true, &[Some(true)], &[Some(false)]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            visible_devices_with_teams(false, false, false, teams),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn browser_mute_cannot_suppress_unattributed_browser_capture() {
+        let teams = resolve_teams_activity_sources(
+            None,
+            TeamsUiSnapshot {
+                browser: teams_window_state(true, &[Some(true)], &[Some(false)]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            visible_devices_with_teams(true, true, false, teams),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn browser_preview_does_not_establish_independent_activity() {
+        let teams = resolve_teams_activity_sources(
+            None,
+            TeamsUiSnapshot {
+                browser: teams_window_state(false, &[Some(false)], &[Some(true)]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            visible_devices_with_teams(false, false, false, teams),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn unknown_browser_microphone_label_keeps_confirmed_call_visible() {
+        let teams = resolve_teams_activity_sources(
+            None,
+            TeamsUiSnapshot {
+                browser: teams_window_state(true, &[None], &[None]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            visible_devices_with_teams(false, false, false, teams),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn browser_read_failure_does_not_override_confirmed_desktop_mute() {
+        let teams = resolve_teams_activity_sources(
+            None,
+            TeamsUiSnapshot {
+                desktop: teams_window_state(true, &[Some(true)], &[Some(false)]),
+                browser: combine_teams_window_states(&[None]),
+            },
+        );
+        assert_eq!(
+            visible_devices_with_teams(false, false, true, teams),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn ending_browser_meeting_clears_its_independent_activity() {
+        let before = resolve_teams_activity_sources(
+            Some((false, false)),
+            TeamsUiSnapshot {
+                browser: live_meeting(),
+                ..Default::default()
+            },
+        );
+        let after =
+            resolve_teams_activity_sources(Some((false, false)), TeamsUiSnapshot::default());
+        assert_eq!(
+            visible_devices_with_teams(false, false, false, before),
+            (true, true)
+        );
+        assert_eq!(
+            visible_devices_with_teams(false, false, false, after),
+            (false, false)
         );
     }
 }

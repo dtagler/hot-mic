@@ -1,13 +1,15 @@
-//! Raw consent-store observations, not authoritative hardware activity.
-//! A stale stopped record or unreadable value looks inactive here. Independent Teams
-//! meeting activity is merged later by `visible_devices_with_teams`.
+//! Consent-store observations supplemented by passive native capture metadata.
+//! A stale stopped record or unreadable value looks inactive in the registry.
+//! Independent Teams activity is merged later by `visible_devices_with_teams`.
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::*;
 
-use hotmic::{is_teams_subkey, parse_in_use, wide_chars as wide};
+use hotmic::{is_teams_subkey, parse_in_use, supplement_registry_capture, wide_chars as wide};
+
+use crate::capture::CaptureMonitor;
 
 const WEBCAM_PATH: &str =
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam";
@@ -16,9 +18,9 @@ const MIC_PATH: &str =
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct DeviceState {
-    /// At least one monitored registry entry reports camera activity.
+    /// Registry or native metadata reports camera activity.
     pub cam: bool,
-    /// At least one non-Teams app entry reports microphone activity.
+    /// Registry or native metadata reports non-Teams microphone activity.
     pub mic_non_teams: bool,
     /// True when at least one Teams subkey (`MSTeams_8wekyb3d8bbwe` or
     /// classic Squirrel path) reports microphone activity. This neither
@@ -29,6 +31,7 @@ pub struct DeviceState {
 pub struct Watcher {
     keys: Vec<HKEY>,
     pub events: Vec<HANDLE>,
+    native: CaptureMonitor,
 }
 
 impl Watcher {
@@ -67,7 +70,11 @@ impl Watcher {
             events.push(event);
         }
 
-        let w = Self { keys, events };
+        let w = Self {
+            keys,
+            events,
+            native: CaptureMonitor::start(),
+        };
         w.arm_all();
         Ok(w)
     }
@@ -96,9 +103,11 @@ impl Watcher {
             || any_in_use(HKEY_LOCAL_MACHINE, WEBCAM_PATH);
         let mic_hkcu = scan_mic(HKEY_CURRENT_USER, MIC_PATH);
         let mic_hklm = scan_mic(HKEY_LOCAL_MACHINE, MIC_PATH);
+        let (cam, mic_non_teams) =
+            supplement_registry_capture(cam, mic_hkcu.0 || mic_hklm.0, self.native.snapshot());
         DeviceState {
             cam,
-            mic_non_teams: mic_hkcu.0 || mic_hklm.0,
+            mic_non_teams,
             mic_teams: mic_hkcu.1 || mic_hklm.1,
         }
     }

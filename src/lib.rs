@@ -1,13 +1,20 @@
 //! Pure, platform-independent helpers used by the hotmic binary.
 //! Kept free of Win32 imports so tests can run on any host.
 
+mod capture_activity;
 mod teams_activity;
+mod teams_browser;
 
+pub use capture_activity::{
+    native_microphone_is_visible, should_retry_native_camera, supplement_registry_capture,
+    CaptureSample, NativeCaptureCache, NativeCaptureState, NativeCaptureUpdate,
+};
 pub use teams_activity::{
     combine_teams_window_states, parse_teams_camera_button_name, resolve_teams_activity,
-    teams_window_state, teams_window_state_from_controls, visible_devices_with_teams,
-    TeamsActivity, TeamsControl, TeamsUiState,
+    resolve_teams_activity_sources, teams_window_state, teams_window_state_from_controls,
+    visible_devices_with_teams, TeamsActivity, TeamsControl, TeamsUiSnapshot, TeamsUiState,
 };
+pub use teams_browser::{is_teams_browser_process, is_teams_web_url, top_level_browser_documents};
 
 pub const COLOR_BLUE: u32 = 0x00FF8000;
 pub const COLOR_RED: u32 = 0x000000DC;

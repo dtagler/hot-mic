@@ -19,12 +19,16 @@ strip = true
 panic = "abort"
 
 [target.'cfg(windows)'.dependencies]
+windows-core = "=0.62.2"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_Media_MediaFoundation",
   "Win32_Networking_WinSock",
   "Win32_Security",
   "Win32_Security_Cryptography",
   "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
   "Win32_System_LibraryLoader",
   "Win32_System_Ole",
   "Win32_System_Registry",

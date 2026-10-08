@@ -23,8 +23,9 @@
 //! DPAPI wrapping is the mitigation for token misuse.
 //!
 //! ## Degradation
-//! A complete Local API state wins for meeting membership and mute while the
-//! connection remains open. Camera fallback still comes from the UI snapshot.
+//! A complete Local API state wins for desktop meeting membership and mute
+//! while connected. Browser meeting activity stays independent of this API.
+//! Camera fallback still comes from the corresponding UI snapshot.
 //! A periodic UI Automation snapshot supplies camera and microphone activity
 //! even when consent-store timestamps are stale. Confirmed meeting controls
 //! distinguish a call from a preview. Unknown mute state never suppresses
@@ -44,9 +45,9 @@ use windows::Win32::Security::Cryptography::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use hotmic::{
-    base64_encode, parse_can_pair, parse_meeting_update, redact_secrets, resolve_teams_activity,
-    ws_build_close_frame, ws_build_text_frame, ws_handshake_request, ws_parse_frame, TeamsActivity,
-    TeamsUiState, WsFrameParse,
+    base64_encode, parse_can_pair, parse_meeting_update, redact_secrets,
+    resolve_teams_activity_sources, ws_build_close_frame, ws_build_text_frame,
+    ws_handshake_request, ws_parse_frame, TeamsActivity, TeamsUiSnapshot, WsFrameParse,
 };
 
 use crate::teams_ui::MeetingDetector;
@@ -92,8 +93,8 @@ pub struct Client {
     is_muted: bool,
     /// Last `meetingState.isInMeeting` we observed from a `meetingUpdate`.
     in_meeting: bool,
-    /// True after the API supplies a complete meeting/mute state on this
-    /// connection. UI sampling continues independently for camera activity.
+    /// True after the API supplies a complete desktop meeting/mute state on
+    /// this connection. UI sampling continues for camera and browser activity.
     meeting_state_seen: bool,
     backoff_ms: u32,
     /// True between scheduling a reconnect and the timer firing. Prevents
@@ -118,7 +119,7 @@ pub struct Client {
     /// Independent read-only meeting-control detector, with or without the API.
     ui_detector: Option<MeetingDetector>,
     /// Replaced by each UI poll, including an empty result after a meeting ends.
-    ui_state: TeamsUiState,
+    ui_state: TeamsUiSnapshot,
 }
 
 impl Client {
@@ -140,7 +141,7 @@ impl Client {
             fragment_opcode: None,
             pair_sent: false,
             ui_detector: MeetingDetector::new().ok(),
-            ui_state: TeamsUiState::default(),
+            ui_state: TeamsUiSnapshot::default(),
         }
     }
 
@@ -159,7 +160,7 @@ impl Client {
     pub fn activity_now(&self) -> TeamsActivity {
         let local_api_state = (self.state == State::Open && self.meeting_state_seen)
             .then_some((self.in_meeting, self.is_muted));
-        resolve_teams_activity(local_api_state, self.ui_state)
+        resolve_teams_activity_sources(local_api_state, self.ui_state)
     }
 
     /// Kick off the first connect attempt. Safe to call exactly once at

@@ -1,6 +1,8 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod autostart;
+mod capture;
+mod capture_mf;
 mod detect;
 mod overlay;
 mod teams;
